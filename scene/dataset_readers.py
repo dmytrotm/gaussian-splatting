@@ -102,7 +102,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         if depths_params is not None:
             try:
                 depth_params = depths_params[extr.name[:-n_remove]]
-            except:
+            except Exception:
                 print("\n", key, "not found in depths_params")
 
         image_path = os.path.join(images_folder, extr.name)
@@ -148,7 +148,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
+    except Exception:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
@@ -209,12 +209,12 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except Exception:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
-    except:
+    except Exception:
         pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
@@ -256,7 +256,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             norm_data = im_data / 255.0
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.array(arr*255.0, dtype=np.uint8), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy 
@@ -298,7 +298,7 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)
-    except:
+    except Exception:
         pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,

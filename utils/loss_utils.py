@@ -15,7 +15,7 @@ from torch.autograd import Variable
 from math import exp
 try:
     from diff_gaussian_rasterization._C import fusedssim, fusedssim_backward
-except:
+except Exception:
     pass
 
 C1 = 0.01 ** 2

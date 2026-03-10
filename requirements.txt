@@ -1,20 +1,24 @@
-# Core dependencies from environment.yml with explicit versions
-plyfile
-tqdm
-pytorch==1.12.1
-torchaudio==0.12.1
-torchvision==0.13.1
+# Core PyTorch stack — CUDA 12.4 builds (compatible with CUDA 12.x drivers)
+# Install with: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# Numerical / image processing
+numpy>=1.26,<2.0
 opencv-python
+Pillow
+
+# 3D / point-cloud
+plyfile
+
+# Utilities
+tqdm
 joblib
 
-# Additional dependencies discovered in the codebase (missing from environment.yml)
-numpy
-scipy
-imageio
-imageio-ffmpeg
-pycolmap
+# Logging (optional but used by train.py when available)
+tensorboard
 
-# Local submodules (will be compiled during installation)
+# Local CUDA extension submodules (compiled during install)
 ./submodules/diff-gaussian-rasterization
 ./submodules/simple-knn
 ./submodules/fused-ssim

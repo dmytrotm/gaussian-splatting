@@ -24,7 +24,7 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
-except:
+except Exception:
     pass
 
 class GaussianModel:
@@ -194,7 +194,7 @@ class GaussianModel:
         elif self.optimizer_type == "sparse_adam":
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
+            except Exception:
                 # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 

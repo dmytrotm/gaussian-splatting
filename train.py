@@ -31,13 +31,13 @@ except ImportError:
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
-except:
+except Exception:
     FUSED_SSIM_AVAILABLE = False
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
-except:
+except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -51,7 +51,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -259,6 +259,7 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
+    parser.add_argument('--web_viewer', action='store_true', default=False, help="Use the newer Viser web-based viewer instead of the legacy TCP viewer")
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
@@ -277,6 +278,11 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
+        if args.web_viewer:
+            import gaussian_renderer.network_gui_web as network_gui_web
+            global network_gui
+            network_gui = network_gui_web
+        
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)

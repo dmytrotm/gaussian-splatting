@@ -23,7 +23,7 @@ from gaussian_renderer import GaussianModel
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
-except:
+except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
 
