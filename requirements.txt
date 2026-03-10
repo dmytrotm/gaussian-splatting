@@ -1,0 +1,20 @@
+# Core dependencies from environment.yml with explicit versions
+plyfile
+tqdm
+pytorch==1.12.1
+torchaudio==0.12.1
+torchvision==0.13.1
+opencv-python
+joblib
+
+# Additional dependencies discovered in the codebase (missing from environment.yml)
+numpy
+scipy
+imageio
+imageio-ffmpeg
+pycolmap
+
+# Local submodules (will be compiled during installation)
+./submodules/diff-gaussian-rasterization
+./submodules/simple-knn
+./submodules/fused-ssim
