@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.random_init = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -97,6 +98,11 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.opacity_reg = 0.0
+        self.scale_reg = 0.0
+        self.patch_size = 0
+        self.pose_noise = 0.0
+        self.grad_accum_steps = 1
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

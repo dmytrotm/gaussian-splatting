@@ -18,6 +18,13 @@ joblib
 # Logging (optional but used by train.py when available)
 tensorboard
 
+# Web viewer (used by viewer.py and --web_viewer flag)
+viser
+nerfview
+
+# Metrics plotting (used by MetricsTracker)
+matplotlib
+
 # Local CUDA extension submodules (compiled during install)
 ./submodules/diff-gaussian-rasterization
 ./submodules/simple-knn

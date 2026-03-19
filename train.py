@@ -9,19 +9,40 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import os
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import MiniCam
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.graphics_utils import getProjectionMatrix
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from densification import get_strategy
+from utils.metrics_tracker import MetricsTracker
+from utils.regularization import opacity_reg_loss, scale_reg_loss
+from scene.camera_opt import CameraOptModule
+
+try:
+    from lpipsPyTorch import lpips as compute_lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+
+try:
+    import viser
+    import nerfview
+    VISER_AVAILABLE = True
+except ImportError:
+    VISER_AVAILABLE = False
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,7 +61,7 @@ try:
 except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, densification_strategy_name="default", viewer_port=0):  # MODIFIED
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -50,6 +71,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    strategy = get_strategy(densification_strategy_name)  # MODIFIED: instantiate strategy
+    tracker = MetricsTracker(output_dir=dataset.model_path)  # MODIFIED: metrics tracking
+
+    # MODIFIED: web viewer — direct viser integration (like gsplat reference)
+    _viewer = None
+    if viewer_port > 0:
+        if not VISER_AVAILABLE:
+            print("[WARNING] viser/nerfview not installed — web viewer disabled.")
+            print("  Install with: pip install viser nerfview")
+        else:
+            print(f"Starting web viewer at http://localhost:{viewer_port}")
+            _viser_server = viser.ViserServer(port=viewer_port, verbose=False)
+
+            @torch.no_grad()
+            def _viewer_render_fn(camera_state: nerfview.CameraState, img_wh):
+                w, h = img_wh
+                fovy = camera_state.fov
+                fovx = 2 * math.atan(math.tan(fovy / 2) * (w / h))
+                w2c = np.linalg.inv(camera_state.c2w)
+                wvt = torch.tensor(w2c, dtype=torch.float32).transpose(0, 1).cuda()
+                proj = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=fovx, fovY=fovy).transpose(0, 1).cuda()
+                full = (wvt.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
+                cam = MiniCam(w, h, fovy, fovx, 0.01, 100.0, wvt, full)
+                try:
+                    img = render(cam, gaussians, pipe, background,
+                                 separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    return img.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+                except Exception as e:
+                    print(f"Viewer render error: {e}")
+                    return np.zeros((h, w, 3), dtype=np.float32)
+
+            _viewer = nerfview.Viewer(
+                server=_viser_server,
+                render_fn=_viewer_render_fn,
+                mode="rendering",
+            )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
@@ -68,23 +125,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # Pose noise: create a frozen perturbation module (applied once, not learned)
+    pose_perturb = None
+    if opt.pose_noise > 0.0:
+        n_cams = len(viewpoint_stack)
+        pose_perturb = CameraOptModule(n_cams).cuda()
+        pose_perturb.random_init(std=opt.pose_noise)
+        pose_perturb.requires_grad_(False)  # frozen — noise only, not optimized
+        print(f"[INFO] Pose noise injected: std={opt.pose_noise}, {n_cams} cameras")
+
+    # Gradient accumulation
+    grad_accum_steps = max(1, opt.grad_accum_steps)
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        # Legacy TCP viewer loop (only when web viewer is NOT active)
+        if _viewer is None:
+            if network_gui.conn == None:
+                network_gui.try_connect()
+            while network_gui.conn != None:
+                try:
+                    net_image_bytes = None
+                    custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                    if custom_cam != None:
+                        net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                    network_gui.send(net_image_bytes, dataset.source_path)
+                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                        break
+                except Exception as e:
+                    network_gui.conn = None
 
         iter_start.record()
 
@@ -117,6 +188,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        # Random patch cropping (when --patch_size > 0)
+        if opt.patch_size > 0:
+            h, w = image.shape[1], image.shape[2]
+            ps = opt.patch_size
+            if h > ps and w > ps:
+                y0 = torch.randint(0, h - ps, (1,)).item()
+                x0 = torch.randint(0, w - ps, (1,)).item()
+                image = image[:, y0:y0+ps, x0:x0+ps]
+                gt_image = gt_image[:, y0:y0+ps, x0:x0+ps]
+
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -124,6 +206,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Opacity regularization
+        if opt.opacity_reg > 0.0:
+            loss = loss + opt.opacity_reg * opacity_reg_loss(gaussians)
+
+        # Scale regularization
+        if opt.scale_reg > 0.0:
+            loss = loss + opt.scale_reg * scale_reg_loss(gaussians)
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -139,7 +229,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        loss.backward()
+        # Scale loss for gradient accumulation
+        (loss / grad_accum_steps).backward()
 
         iter_end.record()
 
@@ -155,26 +246,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            # GPU memory + Gaussian count logging (every 1000 iters)
+            if iteration % 1000 == 0:
+                tracker.log_gpu_memory(iteration)
+                tracker.log_num_gaussians(iteration, gaussians.get_xyz.shape[0])
+
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, tracker)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            # Densification  # MODIFIED: delegate to strategy
+            strategy.step(gaussians, scene, iteration, visibility_filter, viewspace_point_tensor, radii, opt, dataset)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
-
-            # Optimizer step
-            if iteration < opt.iterations:
+            # Optimizer step (with gradient accumulation support)
+            if iteration < opt.iterations and iteration % grad_accum_steps == 0:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
@@ -184,10 +270,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                strategy.post_step(gaussians, iteration, opt)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    # MODIFIED: save metrics and generate plots at end of training
+    tracker.save_json()
+    tracker.plot_all()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -211,7 +302,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, tracker=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -227,6 +318,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                lpips_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -239,12 +331,25 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    if LPIPS_AVAILABLE:
+                        lpips_test += compute_lpips(image.unsqueeze(0), gt_image.unsqueeze(0), net_type='vgg').mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                if LPIPS_AVAILABLE:
+                    lpips_test /= len(config['cameras'])
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}{}".format(
+                    iteration, config['name'], l1_test, psnr_test,
+                    f" LPIPS {lpips_test:.6f}" if LPIPS_AVAILABLE else ""))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    if LPIPS_AVAILABLE:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
+                if tracker is not None and config['name'] == 'test':
+                    metrics = dict(psnr=psnr_test.item(), l1=l1_test.item())
+                    if LPIPS_AVAILABLE:
+                        metrics['lpips'] = lpips_test.item()
+                    tracker.update(iteration=iteration, **metrics)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -259,7 +364,8 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--web_viewer', action='store_true', default=False, help="Use the newer Viser web-based viewer instead of the legacy TCP viewer")
+    parser.add_argument('--viewer_port', type=int, default=0,
+                        help="Port for the viser web viewer (0 = disabled, e.g. 8080)")
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
@@ -267,25 +373,52 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument('--densification_strategy', type=str, default='default', choices=['default', 'mcmc'],
+                        help='Densification strategy: default (Inria) or mcmc')
+    parser.add_argument("--scenes", nargs="+", type=str, default=[],
+                        help="Multiple source paths for batch scene processing")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
-    print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    if not args.disable_viewer:
-        if args.web_viewer:
-            import gaussian_renderer.network_gui_web as network_gui_web
-            global network_gui
-            network_gui = network_gui_web
-        
+    # Start legacy TCP viewer (only when web viewer is not requested)
+    if not args.disable_viewer and args.viewer_port == 0:
         network_gui.init(args.ip, args.port)
+
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+
+    # Batch scene processing: if --scenes is provided, iterate over each
+    if args.scenes:
+        for i, scene_path in enumerate(args.scenes):
+            print(f"\n{'=' * 60}")
+            print(f"  Batch scene {i+1}/{len(args.scenes)}: {scene_path}")
+            print(f"{'=' * 60}")
+            args.source_path = os.path.abspath(scene_path)
+            # Auto-generate model path per scene
+            scene_name = os.path.basename(scene_path.rstrip('/'))
+            args.model_path = os.path.join("./output/", scene_name)
+            dataset_args = lp.extract(args)
+            training(
+                dataset_args, op.extract(args), pp.extract(args),
+                args.test_iterations, args.save_iterations,
+                args.checkpoint_iterations, args.start_checkpoint,
+                args.debug_from, args.densification_strategy,
+                viewer_port=args.viewer_port,
+            )
+            print(f"\n  Scene {scene_name} complete.\n")
+    else:
+        # Single scene (default behavior)
+        print("Optimizing " + args.model_path)
+        training(
+            lp.extract(args), op.extract(args), pp.extract(args),
+            args.test_iterations, args.save_iterations,
+            args.checkpoint_iterations, args.start_checkpoint,
+            args.debug_from, args.densification_strategy,
+            viewer_port=args.viewer_port,
+        )
 
     # All done
     print("\nTraining complete.")

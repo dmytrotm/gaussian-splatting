@@ -21,3 +21,6 @@ dependencies:
     - opencv-python
     - joblib
     - tensorboard
+    - viser
+    - nerfview
+    - matplotlib

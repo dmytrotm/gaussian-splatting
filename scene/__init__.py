@@ -79,6 +79,12 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
+        elif getattr(args, 'random_init', False):
+            self.gaussians.create_from_random(
+                num_points=100_000,
+                spatial_extent=self.cameras_extent,
+                cam_infos=scene_info.train_cameras,
+            )
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
