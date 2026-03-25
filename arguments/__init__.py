@@ -26,14 +26,20 @@ class ParamGroup:
                 key = key[1:]
             t = type(value)
             value = value if not fill_none else None 
-            if shorthand:
-                if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
-                else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+            if t == bool:
+                if value: # Default is True, so add --no-key to set to False
+                    if shorthand:
+                        group.add_argument("--no-" + key, ("-N" + key[0:1]), dest=key, default=value, action="store_false")
+                    else:
+                        group.add_argument("--no-" + key, dest=key, default=value, action="store_false")
+                else: # Default is False, so add --key to set to True
+                    if shorthand:
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    else:
+                        group.add_argument("--" + key, default=value, action="store_true")
             else:
-                if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                if shorthand:
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -105,7 +111,7 @@ class OptimizationParams(ParamGroup):
         self.grad_accum_steps = 1
         self.early_stopping_patience = 0
         self.early_stopping_min_delta = 0.01
-        self.entropy_reg = True
+        self.entropy_reg = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
