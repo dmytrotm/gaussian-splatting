@@ -29,6 +29,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from densification import get_strategy
 from utils.metrics_tracker import MetricsTracker
 from utils.regularization import opacity_reg_loss, scale_reg_loss
+from utils.early_stopping import EarlyStopping
 from scene.camera_opt import CameraOptModule
 
 try:
@@ -73,6 +74,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     strategy = get_strategy(densification_strategy_name)  # MODIFIED: instantiate strategy
     tracker = MetricsTracker(output_dir=dataset.model_path)  # MODIFIED: metrics tracking
+
+    # MODIFIED: early stopping
+    early_stopper = EarlyStopping(
+        patience=opt.early_stopping_patience,
+        min_delta=opt.early_stopping_min_delta,
+        output_dir=dataset.model_path,
+    )
 
     # MODIFIED: web viewer — direct viser integration (like gsplat reference)
     _viewer = None
@@ -235,23 +243,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
+            # Per-iteration timing and VRAM tracking
+            torch.cuda.synchronize()
+            elapsed_ms = iter_start.elapsed_time(iter_end)
+            tracker.log_iter_time(iteration, elapsed_ms)
+            if iteration % 100 == 0:
+                tracker.log_gpu_memory(iteration)
+            if iteration % 1000 == 0:
+                tracker.log_num_gaussians(iteration, gaussians.get_xyz.shape[0])
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                vram_gb = tracker.get_latest_vram_gb()
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Depth": f"{ema_Ll1depth_for_log:.{7}f}",
+                    "VRAM": f"{vram_gb:.2f}GB",
+                    "ms/it": f"{elapsed_ms:.1f}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            # GPU memory + Gaussian count logging (every 1000 iters)
-            if iteration % 1000 == 0:
-                tracker.log_gpu_memory(iteration)
-                tracker.log_num_gaussians(iteration, gaussians.get_xyz.shape[0])
+            test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, tracker)
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, tracker)
+            # Early stopping check
+            if test_psnr is not None and early_stopper.check(iteration, test_psnr):
+                print(f"\n[ITER {iteration}] Early stopping triggered — saving final checkpoint")
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt_early_stop_" + str(iteration) + ".pth")
+                scene.save(iteration)
+                progress_bar.close()
+                break
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -303,6 +329,9 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, tracker=None):
+    """Run evaluation and log metrics. Returns test PSNR if evaluated, else None."""
+    test_psnr_value = None
+
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -350,11 +379,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if LPIPS_AVAILABLE:
                         metrics['lpips'] = lpips_test.item()
                     tracker.update(iteration=iteration, **metrics)
+                    test_psnr_value = psnr_test.item()
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+
+    return test_psnr_value
 
 if __name__ == "__main__":
     # Set up command line argument parser
