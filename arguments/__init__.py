@@ -105,6 +105,7 @@ class OptimizationParams(ParamGroup):
         self.grad_accum_steps = 1
         self.early_stopping_patience = 0
         self.early_stopping_min_delta = 0.01
+        self.entropy_reg = True
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

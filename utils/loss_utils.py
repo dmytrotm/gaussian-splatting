@@ -89,3 +89,61 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
+
+
+# Hard upper bound on entropy weight — prevents runaway pruning when
+# recon_loss spikes on a difficult viewpoint.
+MAX_ENTROPY_WEIGHT = 0.01
+
+
+def entropy_loss(opacity_logits, iteration, recon_loss_val,
+                 visibility_filter=None,
+                 densify_until_iter=15000, warmup_iters=1000,
+                 target_ratio=0.1):
+    """Adaptive opacity entropy loss — pushes opacities toward 0 or 1.
+
+    Applies binary entropy to per-Gaussian sigmoid opacities, masked by
+    visibility_filter so only Gaussians rendered in the current frame
+    are penalized.  This prevents premature pruning of unseen points.
+
+    Schedule:
+      1. Zero during densification (iter < densify_until_iter).
+      2. Linear warmup over warmup_iters after densification.
+      3. Hard-capped at MAX_ENTROPY_WEIGHT to prevent spikes.
+
+    Args:
+        opacity_logits: Raw opacity logits (gaussians._opacity).
+        iteration: Current training iteration.
+        recon_loss_val: Current reconstruction loss (float).
+        visibility_filter: Boolean mask from the rasterizer — only
+            Gaussians that contributed to the current frame are penalized.
+        densify_until_iter: Iteration where densification stops.
+        warmup_iters: Iterations to ramp from 0 → full weight.
+        target_ratio: Peak weight as fraction of recon loss.
+
+    Returns:
+        Weighted entropy loss tensor, or 0.0 if not yet active.
+    """
+    if iteration < densify_until_iter:
+        return 0.0
+
+    # Adaptive weight: ramp up after densification, hard-capped
+    progress = min(1.0, (iteration - densify_until_iter) / max(1, warmup_iters))
+    weight = min(progress * target_ratio * max(recon_loss_val, 1e-6),
+                 MAX_ENTROPY_WEIGHT)
+
+    if weight < 1e-8:
+        return 0.0
+
+    # Mask to visible Gaussians only (if filter provided)
+    logits = opacity_logits[visibility_filter] if visibility_filter is not None else opacity_logits
+
+    # Guard for empty mask (degenerate frame)
+    if logits.numel() == 0:
+        return 0.0
+
+    # Binary entropy: H(o) = -(o·log(o) + (1-o)·log(1-o))
+    o = torch.sigmoid(logits)
+    o = torch.clamp(o, 1e-6, 1.0 - 1e-6)
+    ent = -(o * torch.log(o) + (1.0 - o) * torch.log(1.0 - o))
+    return weight * ent.mean()

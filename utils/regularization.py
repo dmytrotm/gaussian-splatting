@@ -2,6 +2,9 @@
 # Regularization losses — modular loss terms for Gaussian Splatting
 # Ported from gsplat reference (complete_trainer.py L1222-1229)
 #
+# NOTE: Entropy regularization lives in utils/loss_utils.py (entropy_loss)
+# as it is a core loss component, not an optional regularizer.
+#
 
 import torch
 from torch import Tensor

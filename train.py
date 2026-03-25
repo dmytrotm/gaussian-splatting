@@ -14,7 +14,7 @@ import os
 import torch
 import numpy as np
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, entropy_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -214,6 +214,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Entropy loss (3D fixed: visibility mask + weight cap)
+        if opt.entropy_reg:
+            ent_loss = entropy_loss(
+                gaussians._opacity, iteration, loss.item(),
+                visibility_filter=visibility_filter,
+                densify_until_iter=opt.densify_until_iter,
+            )
+            if isinstance(ent_loss, torch.Tensor):
+                loss = loss + ent_loss
 
         # Opacity regularization
         if opt.opacity_reg > 0.0:
