@@ -111,6 +111,8 @@ class OptimizationParams(ParamGroup):
         self.grad_accum_steps = 1
         self.early_stopping_patience = 0
         self.early_stopping_min_delta = 0.01
+        self.cauchy_activation = False
+        self.cauchy_loss = False
         self.entropy_reg = False
         super().__init__(parser, "Optimization Parameters")
 

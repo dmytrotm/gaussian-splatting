@@ -15,6 +15,7 @@ import torch
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, entropy_loss
+from utils.cauchy import CauchyActivation, cauchy_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -142,6 +143,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         pose_perturb.requires_grad_(False)  # frozen — noise only, not optimized
         print(f"[INFO] Pose noise injected: std={opt.pose_noise}, {n_cams} cameras")
 
+    # Cauchy activation (learnable color mapping)
+    color_act = None
+    color_act_optimizer = None
+    if opt.cauchy_activation:
+        color_act = CauchyActivation(channels=3).cuda()
+        # Create a dedicated optimizer for Cauchy parameters to avoid densification issues
+        color_act_optimizer = torch.optim.Adam(color_act.parameters(), lr=1e-3)
+        print("[INFO] Cauchy activation enabled — learnable color mapping")
+
+    if opt.cauchy_loss:
+        print("[INFO] Cauchy loss enabled — robust Lorentzian loss")
+
     # Gradient accumulation
     grad_accum_steps = max(1, opt.grad_accum_steps)
 
@@ -187,7 +200,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, color_activation=color_act)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -207,7 +220,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image = image[:, y0:y0+ps, x0:x0+ps]
                 gt_image = gt_image[:, y0:y0+ps, x0:x0+ps]
 
-        Ll1 = l1_loss(image, gt_image)
+        Ll1 = cauchy_loss(image, gt_image) if opt.cauchy_loss else l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -299,6 +312,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations and iteration % grad_accum_steps == 0:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                if color_act_optimizer is not None:
+                    color_act_optimizer.step()
+                    color_act_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
