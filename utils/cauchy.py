@@ -57,6 +57,29 @@ class CauchyActivation(nn.Module):
         return 0.5 + (1.0 / math.pi) * torch.atan((x - self.mu) / gamma)
 
 
+class BoundedCauchyActivation(nn.Module):
+    """Cauchy activation with hard-bounded learnable parameters.
+
+    Constrains μ ∈ [0.3, 0.7] and γ ∈ [0.05, 0.3] so the activation
+    remains a *refinement* of clamp(0,1) rather than an arbitrary
+    color transform.  This prevents the SH optimizer from chasing a
+    moving target.
+    """
+
+    MU_MIN, MU_MAX = 0.3, 0.7
+    GAMMA_MIN, GAMMA_MAX = 0.05, 0.3
+
+    def __init__(self, channels: int = 3):
+        super().__init__()
+        self.mu = nn.Parameter(torch.full((channels, 1, 1), 0.5))
+        self.gamma = nn.Parameter(torch.full((channels, 1, 1), 0.15))
+
+    def forward(self, x: Tensor) -> Tensor:
+        mu = torch.clamp(self.mu, self.MU_MIN, self.MU_MAX)
+        gamma = torch.clamp(self.gamma, self.GAMMA_MIN, self.GAMMA_MAX)
+        return 0.5 + (1.0 / math.pi) * torch.atan((x - mu) / gamma)
+
+
 def cauchy_loss(pred: Tensor, target: Tensor, scale: float = 0.1) -> Tensor:
     """Cauchy (Lorentzian) robust loss.
 
@@ -84,3 +107,17 @@ def cauchy_loss(pred: Tensor, target: Tensor, scale: float = 0.1) -> Tensor:
     """
     residual = (pred - target) / scale
     return torch.log1p(residual * residual).mean()
+
+
+def scheduled_cauchy_loss(pred: Tensor, target: Tensor,
+                          iteration: int, max_iter: int = 30000) -> Tensor:
+    """Cauchy loss with annealed scale: large (L1-like) → small (texture-focused).
+
+    scale(t) = max(0.1, 1.0 − 0.9 · t / max_iter)
+
+    Early training:  scale ≈ 1.0  → gradient ≈ 2Δ/(1+Δ²) ≈ L2 for Δ<1
+    Late training:   scale = 0.1  → outlier rejection kicks in (see cauchy_loss)
+    """
+    scale = max(0.1, 1.0 - 0.9 * iteration / max(1, max_iter))
+    return cauchy_loss(pred, target, scale=scale)
+

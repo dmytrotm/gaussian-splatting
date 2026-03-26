@@ -114,6 +114,12 @@ class OptimizationParams(ParamGroup):
         self.cauchy_activation = False
         self.cauchy_loss = False
         self.entropy_reg = False
+        # Cauchy stabilization strategies
+        self.cauchy_act_freeze_until = 0
+        self.cauchy_act_bounded = False
+        self.cauchy_grad_aware_densify = False
+        self.max_gaussians = 0
+        self.cauchy_scale_schedule = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
