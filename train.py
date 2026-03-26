@@ -15,7 +15,7 @@ import torch
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, entropy_loss
-from utils.cauchy import CauchyActivation, cauchy_loss
+from utils.cauchy import CauchyActivation, BoundedCauchyActivation, cauchy_loss, scheduled_cauchy_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -147,13 +147,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     color_act = None
     color_act_optimizer = None
     if opt.cauchy_activation:
-        color_act = CauchyActivation(channels=3).cuda()
-        # Create a dedicated optimizer for Cauchy parameters to avoid densification issues
-        color_act_optimizer = torch.optim.Adam(color_act.parameters(), lr=1e-3)
-        print("[INFO] Cauchy activation enabled — learnable color mapping")
+        if opt.cauchy_act_bounded:
+            color_act = BoundedCauchyActivation(channels=3).cuda()
+            print("[INFO] Bounded Cauchy activation — μ∈[0.3,0.7], γ∈[0.05,0.3]")
+        else:
+            color_act = CauchyActivation(channels=3).cuda()
+            print("[INFO] Cauchy activation enabled — learnable color mapping")
+        # Frozen initially if freeze_until > 0 (Strategy 1)
+        act_lr = 1e-3
+        if opt.cauchy_act_freeze_until > 0:
+            for p in color_act.parameters():
+                p.requires_grad = False
+            print(f"[INFO] Activation params frozen until iter {opt.cauchy_act_freeze_until}")
+        color_act_optimizer = torch.optim.Adam(color_act.parameters(), lr=act_lr)
 
     if opt.cauchy_loss:
-        print("[INFO] Cauchy loss enabled — robust Lorentzian loss")
+        if opt.cauchy_scale_schedule:
+            print(f"[INFO] Cauchy loss with scheduled scale (1.0 → 0.1 over {opt.iterations} iters)")
+        else:
+            print("[INFO] Cauchy loss enabled — robust Lorentzian loss (scale=0.1)")
+    if opt.cauchy_grad_aware_densify:
+        print("[INFO] Gradient-aware densification — auto-scaling threshold for Cauchy loss")
+    if opt.max_gaussians > 0:
+        print(f"[INFO] Gaussian count budget — max {opt.max_gaussians:,} points")
 
     # Gradient accumulation
     grad_accum_steps = max(1, opt.grad_accum_steps)
@@ -220,7 +236,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image = image[:, y0:y0+ps, x0:x0+ps]
                 gt_image = gt_image[:, y0:y0+ps, x0:x0+ps]
 
-        Ll1 = cauchy_loss(image, gt_image) if opt.cauchy_loss else l1_loss(image, gt_image)
+        if opt.cauchy_loss:
+            if opt.cauchy_scale_schedule:
+                Ll1 = scheduled_cauchy_loss(image, gt_image, iteration, opt.iterations)
+            else:
+                Ll1 = cauchy_loss(image, gt_image)
+        else:
+            Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -306,13 +328,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification  # MODIFIED: delegate to strategy
+            # Strategy 3: gradient-aware densification threshold
+            if opt.cauchy_grad_aware_densify and opt.cauchy_loss:
+                _saved_thresh = opt.densify_grad_threshold
+                opt.densify_grad_threshold = opt.densify_grad_threshold * 2.0
             strategy.step(gaussians, scene, iteration, visibility_filter, viewspace_point_tensor, radii, opt, dataset)
+            if opt.cauchy_grad_aware_densify and opt.cauchy_loss:
+                opt.densify_grad_threshold = _saved_thresh
+
+            # Strategy 4: Gaussian count budget
+            if opt.max_gaussians > 0 and gaussians.get_xyz.shape[0] > opt.max_gaussians:
+                opacities = gaussians.get_opacity.squeeze()
+                keep_mask = opacities > opacities.quantile(0.1)  # Prune bottom 10%
+                gaussians.prune_points(~keep_mask)
+                torch.cuda.empty_cache()
 
             # Optimizer step (with gradient accumulation support)
             if iteration < opt.iterations and iteration % grad_accum_steps == 0:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if color_act_optimizer is not None:
+                    # Strategy 1: unfreeze after freeze_until
+                    if (opt.cauchy_act_freeze_until > 0
+                            and iteration == opt.cauchy_act_freeze_until
+                            and color_act is not None):
+                        for p in color_act.parameters():
+                            p.requires_grad = True
+                        # Switch to low LR after unfreezing
+                        for pg in color_act_optimizer.param_groups:
+                            pg['lr'] = 1e-5
+                        print(f"\n[ITER {iteration}] Unfreezing Cauchy activation params (lr=1e-5)")
                     color_act_optimizer.step()
                     color_act_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
