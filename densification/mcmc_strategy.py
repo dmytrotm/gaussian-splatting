@@ -98,12 +98,18 @@ class MCMCStrategy(DensificationStrategy):
       1. **Relocation** — dead (low-opacity) Gaussians are teleported to
          positions sampled proportionally from the opacity of live Gaussians.
       2. **Addition** — new Gaussians are sampled from the existing opacity
-         distribution up to a configurable cap.
+         distribution up to an adaptive or fixed cap.
       3. **Position noise** — small covariance-scaled perturbations are added
          to all positions every iteration for stochastic exploration.
 
+    Adaptive budgeting (when ``mcmc_cap_max=0``):
+      * Initial cap = ``max(initial_points × 20, 500_000)``
+      * Scaled by sqrt(n_cameras / 100) to handle multi-view scenes
+      * Grows by 5% each refinement step until a VRAM-aware ceiling
+      * Hard ceiling: 80% of total GPU memory / estimated bytes-per-Gaussian
+
     Config keys (read from *opt*):
-      mcmc_cap_max         (int)   — max number of Gaussians        [1_000_000]
+      mcmc_cap_max         (int)   — 0=adaptive, >0=fixed cap
       mcmc_noise_lr        (float) — noise learning-rate multiplier  [5e5]
       mcmc_min_opacity     (float) — opacity threshold for "dead"    [0.005]
     """
@@ -116,6 +122,44 @@ class MCMCStrategy(DensificationStrategy):
         for n in range(n_max):
             for k in range(n + 1):
                 self._binoms[n, k] = math.comb(n, k)
+        # Adaptive budget state
+        self._adaptive_cap = None
+        self._initial_points = None
+        self._cap_ceiling = None
+
+    # ------------------------------------------------------------------
+    # Adaptive budget helpers
+    # ------------------------------------------------------------------
+
+    def _compute_adaptive_cap(self, gaussians, scene):
+        """Compute a scene-aware Gaussian budget on first call."""
+        n_initial = gaussians.get_xyz.shape[0]
+        self._initial_points = n_initial
+
+        # Base cap: 20× initial SfM points, minimum 500k
+        base_cap = max(n_initial * 20, 500_000)
+
+        # Scale by camera count (more views → more detail needed)
+        n_cams = len(scene.getTrainCameras())
+        cam_scale = max(1.0, math.sqrt(n_cams / 100.0))
+        cap = int(base_cap * cam_scale)
+
+        # VRAM-aware ceiling: Conservative estimate to avoid OOM during feature concatenation
+        total_vram = torch.cuda.get_device_properties(0).total_memory
+        usable_vram = int(total_vram * 0.48)  # lowered from 55%
+        current_usage = torch.cuda.memory_allocated()
+        available = max(usable_vram - current_usage, 0)
+        bytes_per_gaussian = 1200  # increased from 180 to include optimizer + renderer workspace
+        vram_ceiling = max(current_usage // bytes_per_gaussian + available // bytes_per_gaussian, 500_000)
+
+        self._cap_ceiling = int(vram_ceiling)
+        self._adaptive_cap = min(cap, self._cap_ceiling)
+
+        print(f"[MCMC Adaptive] Initial points: {n_initial:,}, "
+              f"cameras: {n_cams}, base cap: {base_cap:,}, "
+              f"camera-scaled: {cap:,}, VRAM ceiling: {self._cap_ceiling:,}")
+        print(f"[MCMC Adaptive] Starting cap: {self._adaptive_cap:,}")
+        return self._adaptive_cap
 
     # ------------------------------------------------------------------
     # Public interface
@@ -130,8 +174,22 @@ class MCMCStrategy(DensificationStrategy):
         refine_every = getattr(opt, "densification_interval", 100)
 
         if iteration < refine_stop and iteration > refine_start and iteration % refine_every == 0:
-            cap_max = getattr(opt, "mcmc_cap_max", 1_000_000)
             min_opacity = getattr(opt, "mcmc_min_opacity", 0.005)
+
+            # Determine cap: fixed or adaptive
+            fixed_cap = getattr(opt, "mcmc_cap_max", 0)
+            if fixed_cap > 0:
+                cap_max = fixed_cap
+            else:
+                # Adaptive mode
+                if self._adaptive_cap is None:
+                    self._compute_adaptive_cap(gaussians, scene)
+                # Grow cap by 2% each refinement step (was 5%), up to ceiling
+                self._adaptive_cap = min(
+                    int(self._adaptive_cap * 1.02),
+                    self._cap_ceiling,
+                )
+                cap_max = self._adaptive_cap
 
             binoms = self._binoms.to(gaussians.get_xyz.device)
 
@@ -139,7 +197,7 @@ class MCMCStrategy(DensificationStrategy):
             self._relocate_gs(gaussians, binoms, min_opacity)
 
             # 2. Add new Gaussians
-            self._add_new_gs(gaussians, binoms, min_opacity, cap_max)
+            self._add_new_gs(gaussians, binoms, min_opacity, cap_max, iteration)
 
             torch.cuda.empty_cache()
 
@@ -199,22 +257,25 @@ class MCMCStrategy(DensificationStrategy):
             for attr in ["_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation", "_opacity"]:
                 getattr(gaussians, attr).data[dead_indices] = getattr(gaussians, attr).data[sampled_idxs]
 
-        # Zero optimizer state for relocated Gaussians
+        # Zero optimizer state for relocated Gaussians natively
         for group in gaussians.optimizer.param_groups:
             stored = gaussians.optimizer.state.get(group["params"][0], None)
             if stored is not None:
-                for key in stored:
-                    if key != "step" and isinstance(stored[key], torch.Tensor):
-                        stored[key][sampled_idxs] = 0
+                for key, val in stored.items():
+                    if key != "step" and isinstance(val, torch.Tensor):
+                        val[sampled_idxs].zero_()
 
     @torch.no_grad()
-    def _add_new_gs(self, gaussians, binoms: Tensor, min_opacity: float, cap_max: int):
+    def _add_new_gs(self, gaussians, binoms: Tensor, min_opacity: float, cap_max: int, iteration: int):
         """Add new Gaussians sampled from the opacity distribution."""
         current_n = gaussians.get_xyz.shape[0]
-        n_target = min(cap_max, int(1.05 * current_n))
+        # Grow population by 2% (was 5%)
+        n_target = min(cap_max, int(1.02 * current_n))
         n_new = max(0, n_target - current_n)
         if n_new == 0:
             return
+
+        print(f"[MCMC Refinement] it {iteration}: points {current_n:,} -> {n_target:,} (cap {cap_max:,})")
 
         opacities = gaussians.get_opacity.flatten()
         probs = opacities

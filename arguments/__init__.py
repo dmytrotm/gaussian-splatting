@@ -120,6 +120,14 @@ class OptimizationParams(ParamGroup):
         self.cauchy_grad_aware_densify = False
         self.max_gaussians = 0
         self.cauchy_scale_schedule = False
+        # MCMC strategy parameters
+        self.mcmc_cap_max = 0  # 0 = adaptive (scene-aware), >0 = fixed cap
+        self.mcmc_noise_lr = 5e5
+        self.mcmc_min_opacity = 0.005
+        # ARGP strategy parameters
+        self.ctprune_ratio = 0.01      # AOP: quantile threshold for opacity pruning during densification
+        self.tp_prune_level = 0.7      # IRP: fraction of Gaussians to freeze by opacity
+        self.recover_level = 0.4       # IRP: fraction of frozen Gaussians to recover by importance
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

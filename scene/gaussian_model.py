@@ -64,6 +64,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.tmp_radii = None
+        # ARGP state: temporary freeze / recovery masks and backed-up optimizer state
+        self.temp_mask = None
+        self.temp_stored_state = {}
         self.setup_functions()
 
     def capture(self):
@@ -261,6 +264,19 @@ class GaussianModel:
             except Exception:
                 # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        elif self.optimizer_type == "lion":
+            from utils.optimizers import Lion
+            # Lion needs lower LR than Adam — 0.3× gives good balance
+            # (0.1× was too conservative → 25.11 dB; 0.5× diverged late → 22.57 dB)
+            for group in l:
+                group['lr'] = group['lr'] * 0.3
+            self.optimizer = Lion(l, lr=0.0, betas=(0.9, 0.99))
+        elif self.optimizer_type == "approx_sln":
+            from utils.optimizers import ApproxSLN
+            self.optimizer = ApproxSLN(l, lr=0.0, beta=0.999, damping=1e-4)
+        else:
+            raise ValueError(f"Unknown optimizer_type: '{self.optimizer_type}'. "
+                             f"Choose from: 'default', 'sparse_adam', 'lion', 'approx_sln'.")
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
@@ -379,12 +395,16 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                if stored_state is not None:
+                    # Zero all per-Gaussian tensor states (skip scalars like 'step')
+                    for key, val in stored_state.items():
+                        if isinstance(val, torch.Tensor) and val.dim() > 0:
+                            stored_state[key] = torch.zeros_like(tensor)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                if stored_state is not None:
+                    self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -394,8 +414,10 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                # Prune all per-Gaussian tensor states (skip scalars like 'step')
+                for key, val in stored_state.items():
+                    if isinstance(val, torch.Tensor) and val.dim() > 0:
+                        stored_state[key] = val[mask]
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
@@ -432,9 +454,10 @@ class GaussianModel:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+                # Extend all per-Gaussian tensor states (skip scalars like 'step')
+                for key, val in stored_state.items():
+                    if isinstance(val, torch.Tensor) and val.dim() > 0:
+                        stored_state[key] = torch.cat((val, torch.zeros_like(extension_tensor)), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
@@ -475,3 +498,192 @@ class GaussianModel:
     # MODIFIED: densify_and_prune() moved to densification/default_strategy.py
 
     # MODIFIED: add_densification_stats() moved to densification/default_strategy.py
+
+    # ------------------------------------------------------------------
+    # ARGP: Temporary freeze / recovery methods (IRP support)
+    # ------------------------------------------------------------------
+
+    def _temp_prune_optimizer(self, mask):
+        """Soft-freeze Gaussians: backup optimizer state, zero it, register grad hooks.
+
+        This does NOT remove Gaussians — it freezes them in-place by:
+        1. Backing up their optimizer state tensors to temp_stored_state
+        2. Zeroing the live optimizer state for frozen params
+        3. Registering gradient hooks that zero out grads for frozen params
+
+        Args:
+            mask: Boolean tensor (N,) — True = frozen.
+        """
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+
+            if stored_state is not None:
+                # Backup all per-Gaussian tensor states (skip scalars like 'step')
+                backup = {}
+                for key, val in stored_state.items():
+                    if isinstance(val, torch.Tensor) and val.dim() > 0:
+                        backup[key] = torch.zeros_like(val)
+                        backup[key][mask] = val[mask].clone()
+                        # Zero live state for frozen Gaussians
+                        val[mask] = 0.0
+                self.temp_stored_state[group["name"]] = backup
+
+                del self.optimizer.state[group['params'][0]]
+
+                # Remove old hook if present
+                if hasattr(group["params"][0], "_grad_hook"):
+                    group["params"][0]._grad_hook.remove()
+
+                # Register gradient hook to zero gradients for frozen params
+                def make_hook(mask_copy):
+                    def hook(grad):
+                        grad = grad.clone()
+                        grad[mask_copy] = 0
+                        return grad
+                    return hook
+
+                group["params"][0]._grad_hook = group["params"][0].register_hook(make_hook(mask))
+
+                group["params"][0] = nn.Parameter(group["params"][0].requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(group["params"][0].requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+        return optimizable_tensors
+
+    def _recover_optimizer(self, new_mask):
+        """Recover frozen Gaussians and delete the rest.
+
+        For Gaussians transitioning from frozen→active: restore backed-up
+        optimizer state. Then physically prune all Gaussians still marked
+        in new_mask (the final freeze mask after recovery decisions).
+
+        Args:
+            new_mask: Boolean tensor (N,) — True = kept (active + recovered).
+        """
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            # Which Gaussians transition from frozen to unfrozen?
+            unfreeze_mask = (self.temp_mask == True) & (new_mask == False)
+
+            backup = self.temp_stored_state[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+
+            if stored_state is not None:
+                # Restore + prune all per-Gaussian tensor states (skip scalars like 'step')
+                for key, val in stored_state.items():
+                    if isinstance(val, torch.Tensor) and val.dim() > 0 and key in backup:
+                        val[unfreeze_mask] = backup[key][unfreeze_mask]
+                        stored_state[key] = val[new_mask]
+                        self.temp_stored_state[group["name"]][key] = \
+                            self.temp_stored_state[group["name"]][key][new_mask]
+
+                # Remove old hook
+                if hasattr(group['params'][0], "_grad_hook"):
+                    group['params'][0]._grad_hook.remove()
+
+                # Register new hook for the updated mask
+                def make_hook(mask_copy):
+                    def hook(grad):
+                        grad = grad.clone()
+                        grad[mask_copy] = 0
+                        return grad
+                    return hook
+
+                group['params'][0]._grad_hook = group['params'][0].register_hook(make_hook(new_mask.clone()))
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(group["params"][0][new_mask].requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(group["params"][0][new_mask].requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+
+        return optimizable_tensors
+
+    def temp_prune(self, tp_level):
+        """ARGP IRP: Temporarily freeze low-opacity Gaussians.
+
+        On first call (temp_mask is None), freeze the bottom tp_level fraction
+        of all Gaussians by opacity. On subsequent calls, only consider
+        currently-active Gaussians and extend the freeze mask.
+
+        Args:
+            tp_level: Float in [0, 1] — fraction to freeze (e.g. 0.7 = bottom 70%).
+
+        Returns:
+            Updated temp_mask (Boolean tensor, True = frozen).
+        """
+        all_opa = self.get_opacity
+        if self.temp_mask is None:
+            # First freeze — consider all Gaussians
+            opacity_level = torch.quantile(all_opa, tp_level)
+            opa_mask = (all_opa < opacity_level).squeeze()
+            tp_mask = opa_mask
+        else:
+            # Subsequent freeze — only consider currently-active Gaussians
+            all_opa_masked = all_opa[~self.temp_mask]
+            opacity_level = torch.quantile(all_opa_masked, tp_level)
+            opa_mask = (all_opa_masked < opacity_level).squeeze()
+
+            opa_mask_full = torch.zeros_like(self.temp_mask, dtype=torch.bool)
+            opa_mask_full[~self.temp_mask] = opa_mask
+            tp_mask = self.temp_mask | opa_mask_full
+
+        optimizable_tensors = self._temp_prune_optimizer(tp_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        torch.cuda.empty_cache()
+        return tp_mask
+
+    def recover_delete(self, recover_ratio, importance_scores):
+        """ARGP IRP: Recover important frozen Gaussians, delete the rest.
+
+        Among frozen Gaussians (temp_mask == True), select the top
+        recover_ratio fraction by importance score for recovery. The rest
+        are permanently deleted.
+
+        Args:
+            recover_ratio: Float in [0, 1] — fraction of frozen to recover.
+            importance_scores: (N, 1) tensor of per-Gaussian importance.
+
+        Returns:
+            recover_grad_mask: Boolean tensor — True = kept (active + recovered).
+        """
+        # Scores for frozen Gaussians only
+        frozen_scores = importance_scores[self.temp_mask]
+        if frozen_scores.numel() == 0:
+            # No frozen Gaussians — nothing to recover or delete
+            self.temp_mask = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+            return torch.ones(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        recover_level = torch.quantile(frozen_scores, 1.0 - recover_ratio)
+        grad_mask = (frozen_scores > recover_level).squeeze()
+
+        # Build full-size mask: True = keep, False = delete
+        recover_grad_mask = torch.ones_like(self.temp_mask, dtype=torch.bool)
+        recover_grad_mask[self.temp_mask] = grad_mask
+
+        optimizable_tensors = self._recover_optimizer(recover_grad_mask)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[recover_grad_mask]
+        self.denom = self.denom[recover_grad_mask]
+        self.max_radii2D = self.max_radii2D[recover_grad_mask]
+
+        torch.cuda.empty_cache()
+        return recover_grad_mask
+

@@ -63,7 +63,7 @@ try:
 except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, densification_strategy_name="default", viewer_port=0):  # MODIFIED
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, densification_strategy_name="default", viewer_port=0, run_name="", plot_dir=""):  # MODIFIED
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -74,7 +74,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     strategy = get_strategy(densification_strategy_name)  # MODIFIED: instantiate strategy
-    tracker = MetricsTracker(output_dir=dataset.model_path)  # MODIFIED: metrics tracking
+    tracker = MetricsTracker(output_dir=dataset.model_path, run_name=run_name)  # MODIFIED: metrics tracking
 
     # MODIFIED: early stopping
     early_stopper = EarlyStopping(
@@ -376,6 +376,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # MODIFIED: save metrics and generate plots at end of training
     tracker.save_json()
     tracker.plot_all()
+    # Generate named plots in central directory if specified
+    if plot_dir and run_name:
+        tracker.plot_named(plot_dir=plot_dir)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -477,10 +480,14 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
-    parser.add_argument('--densification_strategy', type=str, default='default', choices=['default', 'mcmc'],
-                        help='Densification strategy: default (Inria) or mcmc')
+    parser.add_argument('--densification_strategy', type=str, default='default', choices=['default', 'mcmc', 'argp'],
+                        help='Densification strategy: default (Inria), mcmc, or argp (Adaptive Recoverable Pruning)')
     parser.add_argument("--scenes", nargs="+", type=str, default=[],
                         help="Multiple source paths for batch scene processing")
+    parser.add_argument('--run_name', type=str, default='',
+                        help='Name for this run config (used in plot filenames)')
+    parser.add_argument('--plot_dir', type=str, default='',
+                        help='Central directory for named comparison plots')
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -510,6 +517,7 @@ if __name__ == "__main__":
                 args.checkpoint_iterations, args.start_checkpoint,
                 args.debug_from, args.densification_strategy,
                 viewer_port=args.viewer_port,
+                run_name=args.run_name, plot_dir=args.plot_dir,
             )
             print(f"\n  Scene {scene_name} complete.\n")
     else:
@@ -521,6 +529,7 @@ if __name__ == "__main__":
             args.checkpoint_iterations, args.start_checkpoint,
             args.debug_from, args.densification_strategy,
             viewer_port=args.viewer_port,
+            run_name=args.run_name, plot_dir=args.plot_dir,
         )
 
     # All done

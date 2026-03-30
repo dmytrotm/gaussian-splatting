@@ -32,8 +32,9 @@ class MetricsTracker:
         tracker.plot_all()
     """
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, run_name: str = ""):
         self.output_dir = output_dir
+        self.run_name = run_name
         os.makedirs(output_dir, exist_ok=True)
         self._history = defaultdict(list)
         self._start_time = time.time()
@@ -63,8 +64,9 @@ class MetricsTracker:
     def log_gpu_memory(self, iteration: int):
         """Record current and peak GPU memory usage (in GB) for this iteration."""
         import torch
-        mem_current_gb = torch.cuda.memory_allocated() / 1024**3
-        mem_peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+        device = torch.cuda.current_device()
+        mem_current_gb = torch.cuda.memory_allocated(device) / 1024**3
+        mem_peak_gb = torch.cuda.max_memory_allocated(device) / 1024**3
         self._history.setdefault("gpu_mem_gb", [])
         self._history.setdefault("gpu_mem_peak_gb", [])
         self._history.setdefault("gpu_mem_iter", [])
@@ -101,7 +103,104 @@ class MetricsTracker:
         print(f"[MetricsTracker] Saved metrics to {path}")
 
     # ------------------------------------------------------------------
-    # Plotting
+    # Named per-config plots (5 separate images)
+    # ------------------------------------------------------------------
+
+    def plot_named(self, plot_dir: str = None):
+        """Generate 5 separate named plots for this run configuration.
+
+        Files saved: ``{metric}_{run_name}.png`` for each of:
+          1. PSNR vs iteration
+          2. LPIPS vs iteration
+          3. Gaussians vs iteration
+          4. VRAM vs iteration
+          5. Iteration Time vs iteration
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            print("[MetricsTracker] matplotlib not available — skipping named plots.")
+            return
+
+        out = plot_dir or self.output_dir
+        os.makedirs(out, exist_ok=True)
+        name = self.run_name or "unnamed"
+        title_name = name.replace("_", " ").title()
+        iters = self._history.get("iteration", [])
+
+        def _save_plot(x, y, ylabel, title_suffix, filename, color="#2196F3",
+                       ylabel2=None, y2=None, label1=None, label2=None):
+            if not x or not y:
+                return
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(x, y, linewidth=1.8, color=color,
+                    label=label1, marker="o" if len(x) < 30 else None, markersize=3)
+            if y2 and ylabel2:
+                ax.plot(x, y2, linewidth=1.2, linestyle="--", color="#F44336",
+                        alpha=0.7, label=label2)
+                ax.legend(fontsize=10)
+            ax.set_title(f"{title_suffix} — {title_name}", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Iteration", fontsize=11)
+            ax.set_ylabel(ylabel, fontsize=11)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            path = os.path.join(out, filename)
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"[MetricsTracker] Saved {path}")
+
+        # 1. PSNR
+        if "psnr" in self._history and iters:
+            _save_plot(iters, self._history["psnr"], "PSNR (dB)",
+                       "PSNR", f"psnr_{name}.png", color="#4CAF50")
+
+        # 2. LPIPS
+        if "lpips" in self._history and iters:
+            _save_plot(iters, self._history["lpips"], "LPIPS ↓",
+                       "LPIPS", f"lpips_{name}.png", color="#FF9800")
+
+        # 3. Gaussian Count
+        if self._history.get("num_gaussians"):
+            _save_plot(self._history["num_gaussians_iter"],
+                       self._history["num_gaussians"],
+                       "Number of Gaussians", "Gaussian Count",
+                       f"gaussians_{name}.png", color="#9C27B0")
+
+        # 4. VRAM
+        if self._history.get("gpu_mem_gb"):
+            _save_plot(self._history["gpu_mem_iter"],
+                       self._history["gpu_mem_gb"],
+                       "VRAM (GB)", "GPU VRAM Usage",
+                       f"vram_{name}.png", color="#2196F3",
+                       ylabel2="Peak VRAM (GB)",
+                       y2=self._history.get("gpu_mem_peak_gb"),
+                       label1="Current", label2="Peak")
+
+        # 5. Iteration Time
+        if self._history.get("iter_time_ms"):
+            times = self._history["iter_time_ms"]
+            time_iters = self._history["iter_time_iter"]
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(time_iters, times, linewidth=0.5, alpha=0.3, color="#4CAF50")
+            # Rolling average
+            window = min(100, len(times))
+            if window > 1:
+                import numpy as np
+                rolling = np.convolve(times, np.ones(window) / window, mode="valid")
+                offset = window // 2
+                ax.plot(time_iters[offset:offset + len(rolling)], rolling,
+                        linewidth=2.2, color="#2E7D32", label=f"Rolling avg ({window})")
+                ax.legend(fontsize=10)
+            ax.set_title(f"Iteration Time — {title_name}", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Iteration", fontsize=11)
+            ax.set_ylabel("Time (ms)", fontsize=11)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            path = os.path.join(out, f"iter_time_{name}.png")
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"[MetricsTracker] Saved {path}")
+
+    # ------------------------------------------------------------------
+    # Plotting (legacy + named)
     # ------------------------------------------------------------------
 
     def plot_all(self):
@@ -109,6 +208,10 @@ class MetricsTracker:
         if not MATPLOTLIB_AVAILABLE:
             print("[MetricsTracker] matplotlib not available — skipping plots.")
             return
+
+        # Always generate named plots if run_name is set
+        if self.run_name:
+            self.plot_named()
 
         iters = self._history.get("iteration", [])
 
