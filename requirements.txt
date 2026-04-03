@@ -21,11 +21,12 @@ tensorboard
 # Web viewer (used by viewer.py and --web_viewer flag)
 viser
 nerfview
+jaxtyping
+splines
 
 # Metrics plotting (used by MetricsTracker)
 matplotlib
 
-# Local CUDA extension submodules (compiled during install)
-./submodules/diff-gaussian-rasterization
-./submodules/simple-knn
-./submodules/fused-ssim
+# Server Backend (UI)
+aiohttp
+aiohttp-cors

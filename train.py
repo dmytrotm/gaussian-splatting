@@ -91,7 +91,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("  Install with: pip install viser nerfview")
         else:
             print(f"Starting web viewer at http://localhost:{viewer_port}")
-            _viser_server = viser.ViserServer(port=viewer_port, verbose=False)
+            _viser_server = viser.ViserServer(host="0.0.0.0", port=viewer_port, verbose=False)
 
             @torch.no_grad()
             def _viewer_render_fn(camera_state: nerfview.CameraState, img_wh):
@@ -104,12 +104,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 full = (wvt.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
                 cam = MiniCam(w, h, fovy, fovx, 0.01, 100.0, wvt, full)
                 try:
-                    img = render(cam, gaussians, pipe, background,
+                    # Provide a dark blue-grey background so we can visually verify rendering is working 
+                    # instead of getting a black screen that looks like a crash.
+                    viewer_bg = torch.tensor([0.1, 0.15, 0.2], dtype=torch.float32, device="cuda")
+                    img = render(cam, gaussians, pipe, viewer_bg,
                                  separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                     return img.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"Viewer render error: {e}")
-                    return np.zeros((h, w, 3), dtype=np.float32)
+                    # Return solid red to indicate a Python rendering exception!
+                    err_img = np.zeros((h, w, 3), dtype=np.float32)
+                    err_img[:, :, 0] = 1.0
+                    return err_img
 
             _viewer = nerfview.Viewer(
                 server=_viser_server,
