@@ -91,9 +91,9 @@ def fast_ssim(img1, img2):
     return ssim_map.mean()
 
 
-# Hard upper bound on entropy weight — prevents runaway pruning when
-# recon_loss spikes on a difficult viewpoint.
-MAX_ENTROPY_WEIGHT = 0.01
+# Hard upper bound on entropy weight — prevents runaway pruning.
+# Reduced to 0.005 for Pose-Free stability.
+MAX_ENTROPY_WEIGHT = 0.005
 
 
 def entropy_loss(opacity_logits, iteration, recon_loss_val,
@@ -124,11 +124,15 @@ def entropy_loss(opacity_logits, iteration, recon_loss_val,
     Returns:
         Weighted entropy loss tensor, or 0.0 if not yet active.
     """
-    if iteration < densify_until_iter:
+    # For Pose-Free, we need entropy much earlier to prevent billboards.
+    # We use a conservative start (e.g. 7000) or densify_from_iter.
+    start_iter = getattr(gaussians, 'densify_from_iter', 7000) if 'gaussians' in locals() else 7000
+    
+    if iteration < start_iter:
         return 0.0
 
-    # Adaptive weight: ramp up after densification, hard-capped
-    progress = min(1.0, (iteration - densify_until_iter) / max(1, warmup_iters))
+    # Adaptive weight: ramp up after start, hard-capped
+    progress = min(1.0, (iteration - start_iter) / max(1, warmup_iters))
     weight = min(progress * target_ratio * max(recon_loss_val, 1e-6),
                  MAX_ENTROPY_WEIGHT)
 

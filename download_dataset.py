@@ -7,6 +7,7 @@ from pathlib import Path
 
 # dataset urls
 urls = {
+    "tandt": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip",
     "mipnerf360": "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip",
     "mipnerf360_extra": "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip",
     "bilarf_data": "https://huggingface.co/datasets/Yuehao/bilarf_data/resolve/main/bilarf_data.zip",
@@ -26,6 +27,7 @@ urls = {
 
 # rename maps
 dataset_rename_map = {
+    "tandt": "",
     "mipnerf360": "360_v2",
     "mipnerf360_extra": "360_v2",
     "bilarf_data": "bilarf",

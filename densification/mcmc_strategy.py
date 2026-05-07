@@ -176,6 +176,22 @@ class MCMCStrategy(DensificationStrategy):
         if iteration < refine_stop and iteration > refine_start and iteration % refine_every == 0:
             min_opacity = getattr(opt, "mcmc_min_opacity", 0.005)
 
+            # Pose-Free warmup: be very tolerant of low-opacity Gaussians
+            # at the start of densification, since camera poses are still wrong
+            # and most Gaussians will appear "dead" due to misalignment.
+            pose_free = getattr(dataset, 'pose_free', False)
+            pose_refine = getattr(opt, 'pose_refine', False)
+            if pose_free or pose_refine:
+                warmup_iters = 5000  # ramp over 5k iters after densification starts
+                iters_since_start = iteration - refine_start
+                warmup_frac = min(1.0, iters_since_start / warmup_iters)
+                # Ramp: 0.0001 (very tolerant) → target min_opacity
+                min_opacity_floor = 0.0001
+                min_opacity = min_opacity_floor + (min_opacity - min_opacity_floor) * warmup_frac
+                if iters_since_start % 1000 == 0:
+                    print(f"[MCMC Pose-Free] iter {iteration}: min_opacity={min_opacity:.5f} "
+                          f"(warmup {warmup_frac*100:.0f}%), points={gaussians.get_xyz.shape[0]:,}")
+
             # Determine cap: fixed or adaptive
             fixed_cap = getattr(opt, "mcmc_cap_max", 0)
             if fixed_cap > 0:
@@ -201,9 +217,26 @@ class MCMCStrategy(DensificationStrategy):
 
             torch.cuda.empty_cache()
 
-    def post_step(self, gaussians, iteration, opt):
+    def post_step(self, gaussians, iteration, opt, dataset=None):
         """Inject covariance-scaled noise into positions (every iteration)."""
         noise_lr = getattr(opt, "mcmc_noise_lr", 5e5)
+
+        # Pose-Free: suppress noise until well after densification starts
+        # to avoid destabilizing geometry while cameras are still converging.
+        pose_free = False
+        if dataset is not None:
+            pose_free = getattr(dataset, 'pose_free', False)
+        pose_refine = getattr(opt, 'pose_refine', False)
+        if pose_free or pose_refine:
+            refine_start = getattr(opt, "densify_from_iter", 500)
+            noise_delay = refine_start + 3000  # no noise until 3k iters after densification
+            if iteration < noise_delay:
+                return  # skip noise injection entirely
+            # Gradually ramp noise strength over 5k iters
+            ramp_iters = 5000
+            ramp_frac = min(1.0, (iteration - noise_delay) / ramp_iters)
+            noise_lr = noise_lr * ramp_frac
+
         # Use the current xyz learning rate as the base scaler
         lr = None
         for pg in gaussians.optimizer.param_groups:
@@ -269,8 +302,8 @@ class MCMCStrategy(DensificationStrategy):
     def _add_new_gs(self, gaussians, binoms: Tensor, min_opacity: float, cap_max: int, iteration: int):
         """Add new Gaussians sampled from the opacity distribution."""
         current_n = gaussians.get_xyz.shape[0]
-        # Grow population by 2% (was 5%)
-        n_target = min(cap_max, int(1.02 * current_n))
+        # Grow population by 1% (was 2% / 5%)
+        n_target = min(cap_max, int(1.01 * current_n))
         n_new = max(0, n_target - current_n)
         if n_new == 0:
             return

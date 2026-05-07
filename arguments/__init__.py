@@ -63,6 +63,15 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.random_init = False
+        self.random_init_num_points = 100000
+        self.pose_free = False
+        self.pose_lr = 1e-3
+        self.pose_lr_final = 1e-5
+        self.pose_noise = 0.0
+        self.pose_noise_rot = 0.0
+        self.pose_refine = False
+        self.default_fov = 60.0
+        self.progressive_cameras = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -107,7 +116,6 @@ class OptimizationParams(ParamGroup):
         self.opacity_reg = 0.0
         self.scale_reg = 0.0
         self.patch_size = 0
-        self.pose_noise = 0.0
         self.grad_accum_steps = 1
         self.early_stopping_patience = 0
         self.early_stopping_min_delta = 0.01

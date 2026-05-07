@@ -33,7 +33,7 @@ class DensificationStrategy(ABC):
         ...
 
     @abstractmethod
-    def post_step(self, gaussians, iteration, opt):
+    def post_step(self, gaussians, iteration, opt, dataset=None):
         """Optional hook called after the optimizer step each iteration.
 
         Used by MCMCStrategy to inject noise into positions; no-op for default.
@@ -42,5 +42,6 @@ class DensificationStrategy(ABC):
             gaussians: GaussianModel instance.
             iteration: Current training iteration.
             opt: OptimizationParams.
+            dataset: ModelParams (optional, used for pose_free detection).
         """
         ...

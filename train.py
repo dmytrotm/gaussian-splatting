@@ -30,6 +30,8 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from densification import get_strategy
 from utils.metrics_tracker import MetricsTracker
 from utils.regularization import opacity_reg_loss, scale_reg_loss
+from utils.pose_metrics import extract_pose_from_viewmatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.early_stopping import EarlyStopping
 from scene.camera_opt import CameraOptModule
 
@@ -137,19 +139,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    all_train_cameras = scene.getTrainCameras().copy()
+    viewpoint_stack = all_train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
     # Pose noise: create a frozen perturbation module (applied once, not learned)
     pose_perturb = None
-    if opt.pose_noise > 0.0:
-        n_cams = len(viewpoint_stack)
+    if dataset.pose_noise > 0.0:
+        n_cams = len(all_train_cameras)
         pose_perturb = CameraOptModule(n_cams).cuda()
-        pose_perturb.random_init(std=opt.pose_noise)
+        pose_perturb.random_init(std=dataset.pose_noise)
         pose_perturb.requires_grad_(False)  # frozen — noise only, not optimized
-        print(f"[INFO] Pose noise injected: std={opt.pose_noise}, {n_cams} cameras")
+        print(f"[INFO] Pose noise injected: std={dataset.pose_noise}, {n_cams} cameras")
+
+    # Pose-Free: learnable camera pose optimization
+    cam_opt = None
+    cam_opt_optimizer = None
+    pose_free_mode = getattr(dataset, 'pose_free', False)
+    pose_refine_mode = getattr(dataset, 'pose_refine', False)
+    if pose_free_mode or pose_refine_mode:
+        n_cams = len(all_train_cameras)
+        cam_opt = CameraOptModule(n_cams).cuda()
+        cam_opt.zero_init()  # start from identity (initial poses)
+        pose_lr = getattr(dataset, 'pose_lr', 1e-3)
+        pose_lr_final = getattr(dataset, 'pose_lr_final', 1e-5)
+        cam_opt_optimizer = torch.optim.Adam(cam_opt.parameters(), lr=pose_lr)
+        # LR scheduler: exponential decay from pose_lr to pose_lr_final
+        cam_opt_lr_lambda = lambda step: max(
+            pose_lr_final / pose_lr,
+            math.exp(-step * math.log(pose_lr / pose_lr_final) / max(opt.iterations, 1))
+        )
+        cam_opt_scheduler = torch.optim.lr_scheduler.LambdaLR(cam_opt_optimizer, cam_opt_lr_lambda)
+        mode_label = 'Pose-Free' if pose_free_mode else 'Pose Refinement'
+        print(f"[INFO] {mode_label}: learnable pose optimization enabled")
+        print(f"       {n_cams} cameras, lr={pose_lr} → {pose_lr_final}")
+
+    # Progressive camera scheduling for pose-free mode
+    progressive_cameras = getattr(dataset, 'progressive_cameras', True) and pose_free_mode
+    if progressive_cameras:
+        n_total_cams = len(all_train_cameras)
+        prog_start_frac = 0.1  # start with 10% of cameras
+        prog_ramp_iters = min(5000, opt.iterations // 3)  # ramp up over first third
+        print(f"[INFO] Progressive cameras: {int(n_total_cams * prog_start_frac)}/{n_total_cams} → {n_total_cams}/{n_total_cams} over {prog_ramp_iters} iters")
 
     # Cauchy activation (learnable color mapping)
     color_act = None
@@ -211,8 +244,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        # Progressive camera scheduling: limit active cameras early in training
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            if progressive_cameras:
+                frac = min(1.0, prog_start_frac + (1.0 - prog_start_frac) * iteration / prog_ramp_iters)
+                n_active = max(3, int(len(all_train_cameras) * frac))
+                viewpoint_stack = all_train_cameras[:n_active].copy()
+            else:
+                viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
@@ -224,7 +263,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, color_activation=color_act)
+        # Compute differentiable camera transforms if pose optimization or noise is active
+        # NOTE: The CUDA rasterizer does NOT differentiate through viewmatrix/projmatrix.
+        # Instead, we transform means3D in PyTorch so gradients flow: loss → grad_means3D → transform → cam_opt.
+        override_means = None
+        override_cp = None
+        if cam_opt is not None or pose_perturb is not None:
+            # Get the original C2W from the camera's fixed world_view_transform
+            wvt_orig = viewpoint_cam.world_view_transform  # (4, 4) transposed
+            c2w_orig = wvt_orig.transpose(0, 1).inverse()  # (4, 4) true C2W
+            
+            cam_idx_tensor = torch.tensor([viewpoint_cam.uid], device="cuda")
+            
+            # 1. Apply fixed perturbation (noise) if present
+            c2w_noisy = c2w_orig
+            if pose_perturb is not None:
+                c2w_noisy = pose_perturb(c2w_orig.unsqueeze(0), cam_idx_tensor).squeeze(0)
+            
+            # 2. Apply learnable correction
+            c2w_corrected = c2w_noisy
+            if cam_opt is not None:
+                c2w_corrected = cam_opt(c2w_noisy.unsqueeze(0), cam_idx_tensor).squeeze(0)
+            
+            w2c_corrected = c2w_corrected.inverse()
+            
+            # World-space trick: transform Gaussians instead of camera.
+            # A maps world points so that rendering with the ORIGINAL camera 
+            # produces the same image as untransformed points with the CORRECTED camera.
+            A = c2w_orig @ w2c_corrected  # (4, 4), differentiable through cam_opt
+            
+            means3D_orig = gaussians.get_xyz  # (N, 3)
+            override_means = (A[:3, :3] @ means3D_orig.T + A[:3, 3:4]).T  # (N, 3)
+            
+            # Use corrected camera position for SH view-direction evaluation
+            override_cp = c2w_corrected[:3, 3].detach()
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, color_activation=color_act, override_means3D=override_means, override_campos=override_cp)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -334,6 +408,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if cam_opt is not None:
+                    torch.save(cam_opt.state_dict(), os.path.join(scene.model_path, "point_cloud", "iteration_{}".format(iteration), "cam_opt.pth"))
 
             # Densification  # MODIFIED: delegate to strategy
             # Strategy 3: gradient-aware densification threshold
@@ -368,6 +444,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         print(f"\n[ITER {iteration}] Unfreezing Cauchy activation params (lr=1e-5)")
                     color_act_optimizer.step()
                     color_act_optimizer.zero_grad(set_to_none = True)
+                # Camera pose optimization step
+                if cam_opt_optimizer is not None:
+                    cam_opt_optimizer.step()
+                    cam_opt_optimizer.zero_grad(set_to_none=True)
+                    cam_opt_scheduler.step()
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -375,7 +456,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-                strategy.post_step(gaussians, iteration, opt)
+                strategy.post_step(gaussians, iteration, opt, dataset)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

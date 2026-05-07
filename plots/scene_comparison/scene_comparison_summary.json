@@ -1,0 +1,104 @@
+{
+  "baseline": {
+    "truck": {
+      "psnr": 25.43,
+      "lpips": 0.1429,
+      "l1": null,
+      "num_gaussians": 2057904,
+      "vram_gb": 5.26
+    },
+    "kitchen": {
+      "psnr": 31.45964938572475,
+      "lpips": 0.12690563074180058,
+      "l1": 0.01703114669237818,
+      "num_gaussians": 1588236,
+      "vram_gb": 8.256
+    },
+    "difficulty_gap_db": -6.0296
+  },
+  "full_pack": {
+    "truck": {
+      "psnr": 25.8,
+      "lpips": 0.142,
+      "l1": null,
+      "num_gaussians": 2354966,
+      "vram_gb": 5.5
+    },
+    "kitchen": {
+      "psnr": 31.865042604718887,
+      "lpips": 0.1235103741288185,
+      "l1": 0.01678314831640039,
+      "num_gaussians": 4178889,
+      "vram_gb": 10.691
+    },
+    "difficulty_gap_db": -6.065
+  },
+  "mcmc_only": {
+    "truck": {
+      "psnr": 25.75,
+      "lpips": 0.1449,
+      "l1": null,
+      "num_gaussians": 2354966,
+      "vram_gb": 5.4
+    },
+    "kitchen": {
+      "psnr": 31.920072501046317,
+      "lpips": 0.12289769670792988,
+      "l1": 0.01625258124300412,
+      "num_gaussians": 4178889,
+      "vram_gb": 10.691
+    },
+    "difficulty_gap_db": -6.1701
+  },
+  "cauchy_scheduled_mcmc": {
+    "truck": {
+      "psnr": 25.79,
+      "lpips": 0.1427,
+      "l1": null,
+      "num_gaussians": 2354966,
+      "vram_gb": 5.45
+    },
+    "kitchen": {
+      "psnr": 31.804508699689592,
+      "lpips": 0.12341972153101648,
+      "l1": 0.016759565685476575,
+      "num_gaussians": 4178889,
+      "vram_gb": 10.69
+    },
+    "difficulty_gap_db": -6.0145
+  },
+  "argp_conservative": {
+    "truck": {
+      "psnr": 25.58,
+      "lpips": 0.1439,
+      "l1": null,
+      "num_gaussians": 882212,
+      "vram_gb": 3.8
+    },
+    "kitchen": {
+      "psnr": 31.60362254551479,
+      "lpips": 0.1314445348722594,
+      "l1": 0.01701095351683242,
+      "num_gaussians": 535347,
+      "vram_gb": 7.507
+    },
+    "difficulty_gap_db": -6.0236
+  },
+  "entropy_mcmc": {
+    "truck": {
+      "psnr": 25.8,
+      "lpips": 0.143,
+      "l1": null,
+      "num_gaussians": 2354966,
+      "vram_gb": 5.45
+    },
+    "kitchen": {
+      "psnr": 32.02676914760045,
+      "lpips": 0.12269692665764263,
+      "l1": 0.016068625423525062,
+      "num_gaussians": 4178889,
+      "vram_gb": 10.691
+    },
+    "difficulty_gap_db": -6.2268
+  }
+}

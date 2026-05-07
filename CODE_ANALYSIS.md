@@ -79,3 +79,38 @@ All metrics gathered from the algorithmic tests are organized in `/workspace/gau
 - **Quality Distribution**: `plots/final_psnr_bar.png` (MCMC/Full_pack Lead)
 - **Pareto Tradeoffs**: `plots/psnr_vs_gaussians.png` (Mapping visual fidelity against model compression)
 - **Technical Analysis**: `cauchy_gradient_analysis.png` (Lorentzian rejection profile at $c=0.1$)
+
+---
+
+## 5. Differentiable Camera Pose Refinement
+
+### 5.1 CameraOptModule (`scene/camera_opt.py`)
+**Motivation**: Standard 3DGS assumes perfect camera poses from COLMAP. In practice, SfM output contains noise, especially on texture-poor or reflective scenes. This module learns per-camera SE(3) corrections during training.
+
+**Implementation**:
+- Each camera stores a 9-dimensional embedding: 3 for translation delta (dx, dy, dz) and 6 for rotation in Zhou's continuous 6D representation.
+- Initialized to zeros (identity transform) so training starts from COLMAP poses.
+- Correction applied as right-multiplication: `C2W' = C2W · ΔSE(3)`.
+- Separate Adam optimizer with lr=1e-3 → 1e-5 exponential decay.
+
+### 5.2 World-Space Trick (`gaussian_renderer/__init__.py`)
+The CUDA rasterizer treats view/projection matrices as constants (no autograd). Instead of modifying CUDA kernels, we transform Gaussian means in world space:
+
+```
+A = C2W_orig @ C2W_learned⁻¹
+μ' = A[:3,:3] @ μ + A[:3,3]
+```
+
+This makes gradients flow: pixel loss → μ' → A → CameraOptModule parameters.
+
+### 5.3 Experimental Results
+- **Noisy poses (σ=0.1)**: +2.3 dB PSNR over uncorrected baseline
+- **Fully random poses**: Does not converge (~12 dB, degrading) — confirms need for approximate initial poses
+
+### 5.4 Related Files
+- `scene/camera_opt.py` — CameraOptModule implementation
+- `scene/pose_free_loader.py` — Fibonacci-sphere pose initialization for pose-free experiments
+- `utils/pose_metrics.py` — Pose error computation utilities
+- `run_pose_free_experiments.sh` — Experiment runner
+- `plot_noisy_study.py` — PSNR comparison plot generator
+- `plots/pose_free/noisy_pose_study.png` — Final comparison plot

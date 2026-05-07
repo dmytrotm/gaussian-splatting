@@ -41,20 +41,41 @@ class DefaultStrategy(DensificationStrategy):
             if (iteration > opt.densify_from_iter
                     and iteration % opt.densification_interval == 0):
                 size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+
+                # Pose-Free warmup: gradually tighten the opacity pruning
+                # threshold so we don't kill Gaussians that only appear "dead"
+                # because camera poses haven't converged yet.
+                min_opacity = 0.005
+                pose_free = getattr(dataset, 'pose_free', False)
+                pose_refine = getattr(opt, 'pose_refine', False)
+                if pose_free or pose_refine:
+                    warmup_iters = 5000
+                    iters_since_start = iteration - opt.densify_from_iter
+                    warmup_frac = min(1.0, iters_since_start / warmup_iters)
+                    min_opacity_floor = 0.0001
+                    min_opacity = min_opacity_floor + (0.005 - min_opacity_floor) * warmup_frac
+                    if iters_since_start % 1000 == 0:
+                        print(f"[ADC Pose-Free] iter {iteration}: min_opacity={min_opacity:.5f} "
+                              f"(warmup {warmup_frac*100:.0f}%), points={gaussians.get_xyz.shape[0]:,}")
+
                 self.densify_and_prune(
                     gaussians,
                     opt.densify_grad_threshold,
-                    0.005,
+                    min_opacity,
                     scene.cameras_extent,
                     size_threshold,
                     radii,
                 )
 
-            if (iteration % opt.opacity_reset_interval == 0
-                    or (dataset.white_background and iteration == opt.densify_from_iter)):
-                self.reset_opacity(gaussians)
+            # Pose-Free: skip opacity resets entirely — they destroy learned
+            # geometry when cameras are still finding their positions.
+            pose_free = getattr(dataset, 'pose_free', False)
+            if not pose_free:
+                if (iteration % opt.opacity_reset_interval == 0
+                        or (dataset.white_background and iteration == opt.densify_from_iter)):
+                    self.reset_opacity(gaussians)
 
-    def post_step(self, gaussians, iteration, opt):
+    def post_step(self, gaussians, iteration, opt, dataset=None):
         """No-op for the default strategy."""
         pass
 

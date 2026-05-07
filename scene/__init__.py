@@ -14,9 +14,13 @@ import random
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.pose_free_loader import readPoseFreeSceneInfo
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
+# Register pose-free loader
+sceneLoadTypeCallbacks["PoseFree"] = readPoseFreeSceneInfo
 
 class Scene:
 
@@ -40,7 +44,13 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if getattr(args, 'pose_free', False):
+            print("[Pose-Free] Loading scene without COLMAP...")
+            scene_info = sceneLoadTypeCallbacks["PoseFree"](
+                args.source_path, args.images, args.eval,
+                getattr(args, 'default_fov', 60.0),
+                getattr(args, 'random_init_num_points', 100_000))
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -80,8 +90,9 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
         elif getattr(args, 'random_init', False):
+            num_pts = getattr(args, 'random_init_num_points', 100_000)
             self.gaussians.create_from_random(
-                num_points=100_000,
+                num_points=num_pts,
                 spatial_extent=self.cameras_extent,
                 cam_infos=scene_info.train_cameras,
             )

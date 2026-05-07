@@ -15,11 +15,18 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, color_activation=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, color_activation=None, override_means3D=None, override_campos=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
+    
+    override_means3D: Optional (N, 3) tensor of pre-transformed Gaussian means.
+        Used for differentiable pose optimization — the CUDA rasterizer computes
+        gradients for means3D (unlike viewmatrix), so transforming means3D in
+        PyTorch before rendering allows camera gradients to flow.
+    override_campos: Optional (3,) tensor for correct SH view-direction evaluation
+        when using transformed means.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -28,6 +35,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         screenspace_points.retain_grad()
     except Exception:
         pass
+
+    # Use camera's fixed transforms (view/proj matrix overrides removed —
+    # the CUDA rasterizer doesn't differentiate through them)
+    viewmatrix = viewpoint_camera.world_view_transform
+    projmatrix = viewpoint_camera.full_proj_transform
+    campos = override_campos if override_campos is not None else viewpoint_camera.camera_center
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -40,10 +53,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
+        viewmatrix=viewmatrix,
+        projmatrix=projmatrix,
         sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
+        campos=campos,
         prefiltered=False,
         debug=pipe.debug,
         antialiasing=pipe.antialiasing
@@ -51,7 +64,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = override_means3D if override_means3D is not None else pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -74,7 +87,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp = (pc.get_xyz - campos.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)

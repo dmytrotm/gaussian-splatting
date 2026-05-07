@@ -10,3 +10,12 @@ data
 __pycache__
 .venv
 .DS_Store
+
+# Temporary files
+*.log
+nohup.out
+
+# Generated renders (keep plots/ tracked)
+/baseline_30k.png
+/compare_*.png
+/FINAL_DEBUG_*.png

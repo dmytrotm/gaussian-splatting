@@ -149,7 +149,7 @@ class ARGPStrategy(DensificationStrategy):
                 print(f"[ARGP IRP #{self._irp_round}] Current Gaussians: "
                       f"{gaussians.get_xyz.shape[0]:,}")
 
-    def post_step(self, gaussians, iteration, opt):
+    def post_step(self, gaussians, iteration, opt, dataset=None):
         """No-op for ARGP — all work happens in step()."""
         pass
 
