@@ -8,8 +8,10 @@ from pathlib import Path
 # dataset urls
 urls = {
     "tandt": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip",
-    "mipnerf360": "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip",
-    "mipnerf360_extra": "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip",
+    "mipnerf360": [
+        "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip",
+        "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip"
+    ],
     "bilarf_data": "https://huggingface.co/datasets/Yuehao/bilarf_data/resolve/main/bilarf_data.zip",
     "zipnerf": [
         "https://storage.googleapis.com/gresearch/refraw360/zipnerf/berlin.zip",
@@ -29,29 +31,32 @@ urls = {
 dataset_rename_map = {
     "tandt": "",
     "mipnerf360": "360_v2",
-    "mipnerf360_extra": "360_v2",
     "bilarf_data": "bilarf",
     "zipnerf": "zipnerf",
     "zipnerf_undistorted": "zipnerf_undistorted",
 }
 
 
-def download_and_extract(url: str, download_path: Path, extract_path: Path) -> None:
+def download_and_extract(url: str, download_path: Path, extract_path: Path, progress_callback=None) -> None:
     download_path.parent.mkdir(parents=True, exist_ok=True)
     extract_path.mkdir(parents=True, exist_ok=True)
 
-    # download
-    download_command = [
-        "curl",
-        "-L",
-        "-o",
-        str(download_path),
-        url,
-    ]
+    import urllib.request
+    last_percent = [-1]
+    def reporthook(blocknum, blocksize, totalsize):
+        if totalsize > 0:
+            percent = int(blocknum * blocksize * 100 / totalsize)
+            if percent != last_percent[0]:
+                last_percent[0] = percent
+                if progress_callback:
+                    progress_callback(min(percent, 100))
+                else:
+                    print(f"[DOWNLOAD_PROGRESS] {min(percent, 100)}")
+
     try:
-        subprocess.run(download_command, check=True)
+        urllib.request.urlretrieve(url, str(download_path), reporthook)
         print("File downloaded successfully.")
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         print(f"Error downloading file: {e}")
         return
 
@@ -92,7 +97,7 @@ def download_and_extract(url: str, download_path: Path, extract_path: Path) -> N
         print(f"Extraction failed: {e}")
 
 
-def dataset_download(dataset: str, save_dir: Path):
+def dataset_download(dataset: str, save_dir: Path, progress_callback=None):
     save_dir.mkdir(parents=True, exist_ok=True)
     dataset_urls = urls[dataset]
 
@@ -101,12 +106,12 @@ def dataset_download(dataset: str, save_dir: Path):
             url_file_name = Path(url).name
             extract_path = save_dir / dataset_rename_map[dataset]
             download_path = extract_path / url_file_name
-            download_and_extract(url, download_path, extract_path)
+            download_and_extract(url, download_path, extract_path, progress_callback)
     else:
         url_file_name = Path(dataset_urls).name
         extract_path = save_dir / dataset_rename_map[dataset]
         download_path = extract_path / url_file_name
-        download_and_extract(dataset_urls, download_path, extract_path)
+        download_and_extract(dataset_urls, download_path, extract_path, progress_callback)
 
 
 if __name__ == "__main__":

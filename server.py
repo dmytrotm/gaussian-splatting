@@ -43,6 +43,10 @@ RUNS: dict[str, dict] = {}
 WS_CLIENTS: set[web.WebSocketResponse] = set()
 executor = ThreadPoolExecutor(max_workers=4)
 
+# Global processes
+TRAIN_PROC = None
+VIEW_PROC = None
+
 def make_job(job_type: str, meta: dict | None = None) -> dict:
     job = {
         "id": str(uuid.uuid4()),
@@ -79,25 +83,20 @@ def broadcast_from_thread(loop: asyncio.AbstractEventLoop, msg: dict):
 CANONICAL_DATASETS = {
     "mipnerf360": {
         "name": "MipNeRF 360",
-        "scenes": ["garden", "bicycle", "stump", "room", "counter", "kitchen", "bonsai"],
-    },
-    "mipnerf360_extra": {
-        "name": "MipNeRF 360 (Extra)",
-        "scenes": ["flowers", "treehill"],
+        "scenes": ["bicycle", "bonsai", "counter", "garden", "kitchen", "room", "stump", "flowers", "treehill"],
     },
     "bilarf_data": {
-        "name": "BiLARF",
-        "scenes": ["bilarf"],
+        "name": "Bilarf Dataset",
+        "scenes": ["bunker", "campsite", "desolation", "dozer"],
     },
     "zipnerf": {
-        "name": "Zip-NeRF",
-        "scenes": ["berlin", "london", "nyc", "alameda"],
+        "name": "ZipNeRF",
+        "scenes": ["alameda", "berlin", "london", "nyc"],
     },
 }
 
 DATASET_DIR_MAP = {
     "mipnerf360": "360_v2",
-    "mipnerf360_extra": "360_v2",
     "bilarf_data": "bilarf",
     "zipnerf": "zipnerf",
 }
@@ -108,15 +107,26 @@ def scan_datasets():
     for ds_id, info in CANONICAL_DATASETS.items():
         dir_name = DATASET_DIR_MAP.get(ds_id, ds_id)
         ds_path = DATA_DIR / dir_name
-        available = ds_path.exists()
+        available = False
         scenes = []
-        if available:
+        thumbnails = {}
+        if ds_path.exists():
             for child in sorted(ds_path.iterdir()):
                 if child.is_dir():
                     has_sparse = (child / "sparse").exists()
                     has_images = (child / "images").exists()
                     if has_sparse or has_images:
                         scenes.append(child.name)
+                        # Find a thumbnail
+                        img_dir = child / "images"
+                        if img_dir.exists():
+                            for ext in ["*.jpg", "*.JPG", "*.png", "*.PNG"]:
+                                imgs = list(img_dir.glob(ext))
+                                if imgs:
+                                    thumbnails[child.name] = f"/datasets/{dir_name}/{child.name}/images/{imgs[0].name}"
+                                    break
+            if scenes:
+                available = True
         if not scenes:
             scenes = info["scenes"]
         results.append({
@@ -125,24 +135,75 @@ def scan_datasets():
             "type": "canonical",
             "available": available,
             "scenes": scenes,
+            "thumbnails": thumbnails,
         })
     # uploads
     uploads_dir = DATA_DIR / "uploads"
     if uploads_dir.exists():
-        for child in sorted(uploads_dir.iterdir()):
+        # sort by modification time descending
+        children = sorted(uploads_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+        for child in children:
             if child.is_dir():
                 has_sparse = (child / "sparse").exists()
                 has_images = (child / "images").exists()
                 if has_sparse or has_images:
+                    name = child.name
+                    meta_path = child / "meta.json"
+                    if meta_path.exists():
+                        try:
+                            with open(meta_path, "r") as f:
+                                meta = json.load(f)
+                                name = meta.get("original_name", child.name)
+                        except Exception:
+                            pass
+                    
+                    video_url = None
+                    thumbnail_url = None
+                    for f in child.iterdir():
+                        if f.name.startswith("input_video"):
+                            video_url = f"/uploads/{child.name}/{f.name}"
+                            break
+                            
+                    img_dir = child / "images"
+                    if img_dir.exists():
+                        for ext in ["*.jpg", "*.JPG", "*.png", "*.PNG"]:
+                            imgs = list(img_dir.glob(ext))
+                            if imgs:
+                                thumbnail_url = f"/datasets/uploads/{child.name}/images/{imgs[0].name}"
+                                break
+                    
                     results.append({
                         "id": f"upload_{child.name}",
-                        "name": child.name,
+                        "name": name,
                         "type": "upload",
                         "available": True,
                         "scenes": [child.name],
+                        "video_url": video_url,
+                        "thumbnails": {child.name: thumbnail_url} if thumbnail_url else {},
                     })
     return results
 
+
+async def handle_view_run(request: web.Request):
+    run_id = request.match_info["id"]
+    run = RUNS.get(run_id)
+    if not run:
+        if (OUTPUT_DIR / run_id).exists():
+            run = {"id": run_id, "status": "complete", "model_path": str(OUTPUT_DIR / run_id)}
+        else:
+            return web.json_response({"error": "Run not found"}, status=404)
+    
+    if run.get("status") == "running":
+        return web.json_response({"error": "Run is already active in training"}, status=400)
+
+    for r in RUNS.values():
+        if r.get("status") == "running":
+            return web.json_response({"error": "Cannot start viewer while a training run is active"}, status=400)
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(executor, worker_view, run_id, run["model_path"], loop)
+    
+    return web.json_response({"ok": True, "viewer_url": f"http://{HOST}:{VIEWER_PORT}" if VIEWER_PORT > 0 else None})
 
 # ---------------------------------------------------------------------------
 # Blocking workers (run in executor)
@@ -154,9 +215,15 @@ def worker_download(job_id: str, dataset_id: str, loop: asyncio.AbstractEventLoo
         "type": "job_progress", "job_id": job_id, "jobType": "download",
         "step": "download", "message": f"Downloading {dataset_id}...", "percent": 0,
     })
+    def emit(pct: int):
+        broadcast_from_thread(loop, {
+            "type": "job_progress", "job_id": job_id, "jobType": "download",
+            "step": "download", "message": f"Downloading {dataset_id}... {pct}%", "percent": pct,
+        })
+        
     try:
         from download_dataset import dataset_download as dd
-        dd(dataset=dataset_id, save_dir=DATA_DIR)
+        dd(dataset=dataset_id, save_dir=DATA_DIR, progress_callback=emit)
         job["status"] = "complete"
         broadcast_from_thread(loop, {
             "type": "job_complete", "job_id": job_id, "jobType": "download",
@@ -174,9 +241,9 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
     job["status"] = "running"
 
     steps = [
-        ("extract_frames", "Extracting frames from video"),
-        ("feature_extraction", "Running COLMAP feature extraction"),
-        ("feature_matching", "Running COLMAP feature matching"),
+        ("extract_frames", "Extracting frames from video (subsampled)"),
+        ("feature_extraction", "Running COLMAP feature extraction (fast)"),
+        ("feature_matching", "Running COLMAP sequential matching (fast)"),
         ("reconstruction", "Running COLMAP sparse reconstruction"),
         ("convert_model", "Converting model to TXT format"),
     ]
@@ -200,27 +267,34 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
         images_dir = upload_dir / "images"
         images_dir.mkdir(exist_ok=True)
 
-        # 1. Extract frames
-        emit("extract_frames", "Extracting frames with ffmpeg...", 0)
+        # 1. Extract frames — subsample every 2nd frame and resize small
+        emit("extract_frames", "Extracting frames with ffmpeg (subsampled, max 1024px)...", 0)
         cmd = [
             "ffmpeg", "-i", str(video_file),
-            "-qscale:v", "1", "-qmin", "1",
+            "-vf", "select=not(mod(n\\,2)),scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
+            "-vsync", "vfr",
+            "-qscale:v", "2", "-qmin", "1",
             str(images_dir / "%04d.jpg"),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {r.stderr[:500]}")
-        emit("extract_frames", "Frames extracted", 20)
+        n_frames = len(list(images_dir.glob("*.jpg")))
+        emit("extract_frames", f"Extracted {n_frames} frames", 20)
 
-        # 2. Feature extraction
-        emit("feature_extraction", "Extracting features...", 20)
+        # 2. Feature extraction — extremely reduced features for speed
+        emit("feature_extraction", "Extracting features (ultra-fast mode: 2048 features)...", 20)
         db_path = upload_dir / "database.db"
         cmd = [
             COLMAP_BIN, "feature_extractor",
             "--database_path", str(db_path),
             "--image_path", str(images_dir),
             "--ImageReader.single_camera", "1",
+            "--ImageReader.camera_model", "PINHOLE",
             "--SiftExtraction.use_gpu", "0",
+            "--SiftExtraction.max_num_features", "2048",
+            "--SiftExtraction.first_octave", "0",
+            "--SiftExtraction.upright", "1", # assume video isn't spinning wildly
         ]
         import os
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
@@ -229,20 +303,22 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
             raise RuntimeError(f"Feature extraction failed: {r.stderr[:500]}")
         emit("feature_extraction", "Features extracted", 40)
 
-        # 3. Feature matching
-        emit("feature_matching", "Matching features...", 40)
+        # 3. Feature matching — sequential matcher with minimal overlap
+        emit("feature_matching", "Sequential matching (ultra-fast, 10 overlap)...", 40)
         cmd = [
-            COLMAP_BIN, "exhaustive_matcher",
+            COLMAP_BIN, "sequential_matcher",
             "--database_path", str(db_path),
             "--SiftMatching.use_gpu", "0",
+            "--SequentialMatching.overlap", "10",
+            "--SequentialMatching.loop_detection", "0",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"Feature matching failed: {r.stderr[:500]}")
         emit("feature_matching", "Features matched", 60)
 
-        # 4. Sparse reconstruction
-        emit("reconstruction", "Building sparse model...", 60)
+        # 4. Sparse reconstruction — extremely relaxed tolerances for pure pose speed
+        emit("reconstruction", "Building sparse model (ultra-fast)...", 60)
         sparse_dir = upload_dir / "sparse"
         sparse_dir.mkdir(exist_ok=True)
         cmd = [
@@ -250,6 +326,11 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
             "--database_path", str(db_path),
             "--image_path", str(images_dir),
             "--output_path", str(sparse_dir),
+            "--Mapper.ba_global_function_tolerance", "0.001",
+            "--Mapper.ba_global_max_num_iterations", "15",
+            "--Mapper.ba_local_max_num_iterations", "10",
+            "--Mapper.min_num_matches", "10",
+            "--Mapper.min_model_size", "5",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if r.returncode != 0:
@@ -286,19 +367,56 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
         })
 
 
+def worker_view(run_id: str, model_path: str, loop: asyncio.AbstractEventLoop):
+    global VIEW_PROC
+    if VIEW_PROC is not None:
+        try:
+            VIEW_PROC.terminate()
+            VIEW_PROC.wait(timeout=2)
+        except Exception:
+            pass
+        VIEW_PROC = None
+    
+    import os
+    os.system("pkill -f view.py")
+        
+    log_path = os.path.join(model_path, "view.log")
+    log_file = open(log_path, "w")
+    cmd = [
+        sys.executable, "view.py",
+        "-m", model_path
+    ]
+    VIEW_PROC = subprocess.Popen(cmd, cwd=str(REPO_ROOT), stdout=log_file, stderr=subprocess.STDOUT)
+
+
 def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
     """Run training in a thread, parsing stdout for progress."""
+    global TRAIN_PROC, VIEW_PROC
     run = RUNS[run_id]
-    run["status"] = "running"
-
     try:
-        import torch
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available")
+        run["status"] = "running"
+        broadcast_from_thread(loop, {
+            "type": "run_status", "run_id": run_id, "status": "running"
+        })
 
-        model_path = str(OUTPUT_DIR / run_id)
+        if VIEW_PROC:
+            try:
+                VIEW_PROC.terminate()
+                VIEW_PROC.wait(timeout=2)
+            except Exception:
+                pass
+        
+        # Also aggressively kill any orphaned view.py processes just in case
+        import os
+        os.system("pkill -f view.py")
+
+        model_path = os.path.join(OUTPUT_DIR, run_id)
         os.makedirs(model_path, exist_ok=True)
         os.makedirs(os.path.join(model_path, "previews"), exist_ok=True)
+        
+        # Save run params
+        with open(os.path.join(model_path, "params.json"), "w") as f:
+            json.dump(params, f)
 
         # Build command
         cmd = [
@@ -311,6 +429,7 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
             "--viewer_port", str(VIEWER_PORT),
             "--test_iterations", "7000", "30000",
             "--save_iterations", "7000", "30000",
+            "--eval",  # ALways evaluate on test set to produce PSNR metrics
         ]
 
         if params.get("optimizer_type") and params["optimizer_type"] != "default":
@@ -327,7 +446,7 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
         total_iters = int(params.get("iterations", 30000))
 
         # Run as subprocess to capture stdout
-        proc = subprocess.Popen(
+        TRAIN_PROC = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=REPO_ROOT,
         )
@@ -335,17 +454,18 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
         iteration_re = re.compile(
             r"Training progress.*?(\d+)%\|.*?(\d+)/(\d+).*?Loss[=:]\s*([\d.]+)"
         )
-        loss_re = re.compile(r"Loss[=:]\s*([\d.eE\-\+]+)")
-        vram_re = re.compile(r"VRAM[=:]\s*([\d.]+)")
         iter_re = re.compile(r"(\d+)%\|")
+        loss_re = re.compile(r"Loss[=:,]\s*([\d.eE\-\+]+)")
+        vram_re = re.compile(r"VRAM[=:,]\s*([\d.]+)GB")
         saving_re = re.compile(r"\[ITER (\d+)\] Saving Gaussians")
-        eval_psnr_re = re.compile(r"\[ITER (\d+)\] Evaluating test.*?PSNR\s+tensor\(([\d.]+)")
+        eval_psnr_re = re.compile(r"\[ITER (\d+)\] Evaluating test.*?PSNR\s+([\d.]+)")
+        preview_re = re.compile(r"\[PREVIEW\s+(\d+)\]")
 
         last_broadcast = 0
         current_iter = 0
         last_lines = []
 
-        for line in proc.stdout:
+        for line in TRAIN_PROC.stdout:
             line = line.strip()
             if not line:
                 continue
@@ -381,6 +501,16 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
                             "image_url": f"/renders/{run_id}/test/ours_{save_iter}/renders/00000.png",
                         })
                         break
+            
+            preview_match = preview_re.search(line)
+            if preview_match:
+                prev_iter = int(preview_match.group(1))
+                broadcast_from_thread(loop, {
+                    "type": "run_preview",
+                    "run_id": run_id,
+                    "iter": prev_iter,
+                    "image_url": f"/renders/{run_id}/previews/{prev_iter:05d}.png",
+                })
 
             # Check for PSNR evaluation
             psnr_match = eval_psnr_re.search(line)
@@ -403,11 +533,13 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
                 broadcast_from_thread(loop, msg)
                 last_broadcast = now
 
-        proc.wait()
+        TRAIN_PROC.wait()
+        returncode = TRAIN_PROC.returncode
+        TRAIN_PROC = None
 
-        if proc.returncode != 0:
+        if returncode != 0:
             error_msg = "\\n".join(last_lines)
-            raise RuntimeError(f"Training process exited with code {proc.returncode}\\n{error_msg}")
+            raise RuntimeError(f"Training process exited with code {returncode}\\n{error_msg}")
 
         # Load final metrics if available
         metrics_file = os.path.join(model_path, "metrics.json")
@@ -422,6 +554,7 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
         })
 
     except Exception as e:
+        TRAIN_PROC = None
         run["status"] = "error"
         run["error"] = str(e)
         broadcast_from_thread(loop, {
@@ -475,6 +608,11 @@ async def handle_upload(request: web.Request):
     ext = Path(filename).suffix or ".mp4"
     dest = upload_dir / f"input_video{ext}"
 
+    # Save metadata
+    meta_path = upload_dir / "meta.json"
+    with open(meta_path, "w") as f:
+        json.dump({"original_name": filename}, f)
+
     with open(dest, "wb") as f:
         while True:
             chunk = await field.read_chunk(8192)
@@ -491,6 +629,11 @@ async def handle_upload(request: web.Request):
 async def handle_create_run(request: web.Request):
     body = await request.json()
 
+    # Prevent concurrent runs
+    for r in RUNS.values():
+        if r.get("status") in ["queued", "running"]:
+            return web.json_response({"error": "A training run is already active. Please wait for it to finish."}, status=409)
+
     try:
         import torch
         if not torch.cuda.is_available():
@@ -498,7 +641,23 @@ async def handle_create_run(request: web.Request):
     except ImportError:
         return web.json_response({"error": "PyTorch not installed"}, status=503)
 
-    run_id = str(uuid.uuid4())[:8]
+    base_name = body.get("name", "")
+    if base_name:
+        import re
+        # Remove extension if any
+        if '.' in base_name:
+            base_name = base_name.rsplit('.', 1)[0]
+        # Sanitize name
+        base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
+        
+        run_id = base_name
+        counter = 1
+        while (OUTPUT_DIR / run_id).exists():
+            run_id = f"{base_name}_{counter}"
+            counter += 1
+    else:
+        run_id = str(uuid.uuid4())[:8]
+
     source_path = body.get("source_path", "")
     scene = body.get("scene", "")
 
@@ -549,6 +708,7 @@ async def handle_list_runs(request: web.Request):
         for child in OUTPUT_DIR.iterdir():
             if child.is_dir() and child.name not in RUNS:
                 cfg_file = child / "cfg_args"
+                params_file = child / "params.json"
                 metrics_file = child / "metrics.json"
                 run_info = {
                     "id": child.name,
@@ -557,14 +717,30 @@ async def handle_list_runs(request: web.Request):
                     "metrics": {},
                     "created_at": child.stat().st_mtime,
                 }
+                if params_file.exists():
+                    try:
+                        run_info["params"] = json.loads(params_file.read_text())
+                    except Exception:
+                        pass
                 if cfg_file.exists():
                     try:
-                        run_info["params"]["cfg_args"] = cfg_file.read_text()
+                        cfg_str = cfg_file.read_text()
+                        run_info["params"]["cfg_args"] = cfg_str
+                        import re
+                        m_opt = re.search(r"optimizer_type=['\"]?([^,\)'\"]+)['\"]?", cfg_str)
+                        if m_opt: run_info["params"]["optimizer_type"] = m_opt.group(1)
+                        m_den = re.search(r"densification_strategy=['\"]?([^,\)'\"]+)['\"]?", cfg_str)
+                        if m_den: run_info["params"]["densification_strategy"] = m_den.group(1)
                     except Exception:
                         pass
                 if metrics_file.exists():
                     try:
-                        run_info["metrics"] = json.loads(metrics_file.read_text())
+                        metrics_data = json.loads(metrics_file.read_text())
+                        for k, v in metrics_data.items():
+                            if isinstance(v, list) and len(v) > 0:
+                                run_info["metrics"][k] = v[-1]
+                            else:
+                                run_info["metrics"][k] = v
                     except Exception:
                         pass
                 results.append(run_info)
@@ -650,13 +826,20 @@ def create_app():
     app.router.add_post("/api/runs", handle_create_run)
     app.router.add_get("/api/runs", handle_list_runs)
     app.router.add_get("/api/runs/{id}", handle_get_run)
+    app.router.add_post("/api/runs/{id}/view", handle_view_run)
     app.router.add_get("/api/runs/{id}/renders", handle_run_renders)
     app.router.add_get("/api/jobs/{id}", handle_get_job)
     app.router.add_get("/ws", handle_ws)
 
-    # Static file serving for renders
+    # Static file serving for renders and uploads
     if OUTPUT_DIR.exists():
         app.router.add_static("/renders/", path=str(OUTPUT_DIR), name="renders")
+    
+    uploads_dir = DATA_DIR / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    app.router.add_static("/uploads/", path=str(uploads_dir), name="uploads")
+    
+    app.router.add_static("/datasets/", path=str(DATA_DIR), name="datasets")
 
     # CORS
     cors = aiohttp_cors.setup(app, defaults={

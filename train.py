@@ -15,6 +15,7 @@ import torch
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, entropy_loss
+from utils.orientation_utils import compute_up_vector_from_density
 from utils.cauchy import CauchyActivation, BoundedCauchyActivation, cauchy_loss, scheduled_cauchy_loss
 from gaussian_renderer import render, network_gui
 import sys
@@ -94,10 +95,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             print(f"Starting web viewer at http://localhost:{viewer_port}")
             _viser_server = viser.ViserServer(host="0.0.0.0", port=viewer_port, verbose=False)
+            
+            try:
+                up_vec = compute_up_vector_from_density(gaussians.get_xyz)
+                _viser_server.scene.set_up_direction(up_vec)
+                print(f"Set Viser up direction from density to {up_vec}")
+            except Exception as e:
+                print(f"Failed to set up direction from density: {e}")
+                _viser_server.scene.set_up_direction("-y")
 
             @torch.no_grad()
             def _viewer_render_fn(camera_state: nerfview.CameraState, img_wh):
-                w, h = img_wh
+                if hasattr(img_wh, 'viewer_width'):
+                    w, h = img_wh.viewer_width, img_wh.viewer_height
+                else:
+                    w, h = img_wh
                 fovy = camera_state.fov
                 fovx = 2 * math.atan(math.tan(fovy / 2) * (w / h))
                 w2c = np.linalg.inv(camera_state.c2w)
@@ -372,6 +384,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Per-iteration timing and VRAM tracking
             torch.cuda.synchronize()
+            if iteration % 1000 == 0:
+                try:
+                    import torchvision
+                    preview_cam = scene.getTrainCameras()[0]
+                    render_pkg = render(preview_cam, gaussians, pipe, background, separate_sh=use_sparse_adam)
+                    preview_dir = os.path.join(scene.model_path, "previews")
+                    os.makedirs(preview_dir, exist_ok=True)
+                    preview_path = os.path.join(preview_dir, f"{iteration:05d}.png")
+                    torchvision.utils.save_image(render_pkg["render"], preview_path)
+                    print(f"\n[PREVIEW {iteration}] Saved to {preview_path}")
+                except Exception as e:
+                    print(f"Failed to save preview: {e}")
             elapsed_ms = iter_start.elapsed_time(iter_end)
             tracker.log_iter_time(iteration, elapsed_ms)
             if iteration % 100 == 0:
