@@ -58,6 +58,7 @@ def start_viewer(dataset: ModelParams, pipeline: PipelineParams):
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         server = viser.ViserServer(port=8081, verbose=True)
+        server.gui.configure_theme(control_layout="collapsible")
         try:
             up_vec = compute_up_vector_from_cameras(dataset.model_path)
             server.scene.set_up_direction(up_vec)

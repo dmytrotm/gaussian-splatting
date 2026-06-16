@@ -7,12 +7,17 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
-import time
 import uuid
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# Fix threading limits for OpenBLAS/OMP on many-core machines
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
 
 # Add repo root to sys.path so splatting imports work
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -184,6 +189,23 @@ def scan_datasets():
     return results
 
 
+async def handle_stop_run(request: web.Request):
+    global TRAIN_PROC
+    run_id = request.match_info["id"]
+    run = RUNS.get(run_id)
+    if not run or run.get("status") != "running":
+        return web.json_response({"error": "Run is not active"}, status=400)
+
+    run["stopped_by_user"] = True
+    if TRAIN_PROC is not None:
+        try:
+            TRAIN_PROC.terminate()
+        except Exception:
+            pass
+
+    return web.json_response({"ok": True})
+
+
 async def handle_view_run(request: web.Request):
     run_id = request.match_info["id"]
     run = RUNS.get(run_id)
@@ -267,11 +289,11 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
         images_dir = upload_dir / "images"
         images_dir.mkdir(exist_ok=True)
 
-        # 1. Extract frames — subsample every 2nd frame and resize small
-        emit("extract_frames", "Extracting frames with ffmpeg (subsampled, max 1024px)...", 0)
+        # 1. Extract frames — high fps and resolution for best coverage
+        emit("extract_frames", "Extracting frames with ffmpeg (12 fps, max 1024px)...", 0)
         cmd = [
             "ffmpeg", "-i", str(video_file),
-            "-vf", "select=not(mod(n\\,2)),scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
+            "-vf", "fps=12,scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease",
             "-vsync", "vfr",
             "-qscale:v", "2", "-qmin", "1",
             str(images_dir / "%04d.jpg"),
@@ -282,8 +304,8 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
         n_frames = len(list(images_dir.glob("*.jpg")))
         emit("extract_frames", f"Extracted {n_frames} frames", 20)
 
-        # 2. Feature extraction — extremely reduced features for speed
-        emit("feature_extraction", "Extracting features (ultra-fast mode: 2048 features)...", 20)
+        # 2. Feature extraction — high quality features
+        emit("feature_extraction", "Extracting features (fast mode: 3000 features)...", 20)
         db_path = upload_dir / "database.db"
         cmd = [
             COLMAP_BIN, "feature_extractor",
@@ -292,7 +314,8 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
             "--ImageReader.single_camera", "1",
             "--ImageReader.camera_model", "PINHOLE",
             "--SiftExtraction.use_gpu", "0",
-            "--SiftExtraction.max_num_features", "2048",
+            "--SiftExtraction.num_threads", "16",
+            "--SiftExtraction.max_num_features", "3000",
             "--SiftExtraction.first_octave", "0",
             "--SiftExtraction.upright", "1", # assume video isn't spinning wildly
         ]
@@ -303,13 +326,14 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
             raise RuntimeError(f"Feature extraction failed: {r.stderr[:500]}")
         emit("feature_extraction", "Features extracted", 40)
 
-        # 3. Feature matching — sequential matcher with minimal overlap
-        emit("feature_matching", "Sequential matching (ultra-fast, 10 overlap)...", 40)
+        # 3. Feature matching — sequential matcher with good overlap
+        emit("feature_matching", "Sequential matching (overlap: 20)...", 40)
         cmd = [
             COLMAP_BIN, "sequential_matcher",
             "--database_path", str(db_path),
             "--SiftMatching.use_gpu", "0",
-            "--SequentialMatching.overlap", "10",
+            "--SiftMatching.num_threads", "16",
+            "--SequentialMatching.overlap", "20",
             "--SequentialMatching.loop_detection", "0",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -326,10 +350,12 @@ def worker_colmap(job_id: str, upload_dir: Path, loop: asyncio.AbstractEventLoop
             "--database_path", str(db_path),
             "--image_path", str(images_dir),
             "--output_path", str(sparse_dir),
-            "--Mapper.ba_global_function_tolerance", "0.001",
-            "--Mapper.ba_global_max_num_iterations", "15",
-            "--Mapper.ba_local_max_num_iterations", "10",
-            "--Mapper.min_num_matches", "10",
+            "--Mapper.ba_global_function_tolerance", "0.005",
+            "--Mapper.ba_global_max_num_iterations", "10",
+            "--Mapper.ba_local_max_num_iterations", "5",
+            "--Mapper.ba_global_images_ratio", "1.4",
+            "--Mapper.ba_global_points_ratio", "1.4",
+            "--Mapper.min_num_matches", "15",
             "--Mapper.min_model_size", "5",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -537,15 +563,26 @@ def worker_train(run_id: str, params: dict, loop: asyncio.AbstractEventLoop):
         returncode = TRAIN_PROC.returncode
         TRAIN_PROC = None
 
-        if returncode != 0:
-            error_msg = "\\n".join(last_lines)
-            raise RuntimeError(f"Training process exited with code {returncode}\\n{error_msg}")
-
         # Load final metrics if available
         metrics_file = os.path.join(model_path, "metrics.json")
         if os.path.exists(metrics_file):
-            with open(metrics_file) as f:
-                run["metrics"].update(json.load(f))
+            try:
+                with open(metrics_file) as f:
+                    run["metrics"].update(json.load(f))
+            except Exception:
+                pass
+
+        if run.get("stopped_by_user"):
+            run["status"] = "complete"
+            broadcast_from_thread(loop, {
+                "type": "run_complete", "run_id": run_id,
+                "metrics": run["metrics"],
+            })
+            return
+
+        if returncode != 0:
+            error_msg = "\n".join(last_lines)
+            raise RuntimeError(f"Training process exited with code {returncode}\n{error_msg}")
 
         run["status"] = "complete"
         broadcast_from_thread(loop, {
@@ -691,6 +728,17 @@ async def handle_create_run(request: web.Request):
     })
 
 
+def _flatten_metrics(metrics: dict) -> dict:
+    """Flatten list values to their last element to keep list API responses small."""
+    out = {}
+    for k, v in metrics.items():
+        if isinstance(v, list):
+            out[k] = v[-1] if v else None
+        else:
+            out[k] = v
+    return out
+
+
 async def handle_list_runs(request: web.Request):
     results = []
     # In-memory runs
@@ -699,7 +747,7 @@ async def handle_list_runs(request: web.Request):
             "id": run["id"],
             "status": run["status"],
             "params": run.get("params", {}),
-            "metrics": run.get("metrics", {}),
+            "metrics": _flatten_metrics(run.get("metrics", {})),
             "created_at": run.get("created_at"),
             "viewer_url": run.get("viewer_url"),
         })
@@ -826,6 +874,7 @@ def create_app():
     app.router.add_post("/api/runs", handle_create_run)
     app.router.add_get("/api/runs", handle_list_runs)
     app.router.add_get("/api/runs/{id}", handle_get_run)
+    app.router.add_post("/api/runs/{id}/stop", handle_stop_run)
     app.router.add_post("/api/runs/{id}/view", handle_view_run)
     app.router.add_get("/api/runs/{id}/renders", handle_run_renders)
     app.router.add_get("/api/jobs/{id}", handle_get_job)
